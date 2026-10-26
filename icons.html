@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Craft 图标库</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --surface: #fff; --text: #1f2328; --text-muted: #656d76;
+    --primary: #0969da; --danger: #cf222e; --border: #d0d7de; --radius: 8px;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--text); margin: 0; padding: 24px; }
+  h1 { margin: 0 0 4px; font-size: 20px; }
+  .hint { color: var(--text-muted); font-size: 13px; margin-bottom: 20px; }
+  .category { margin-bottom: 24px; }
+  .cat-title { font-size: 14px; font-weight: 600; margin: 0 0 10px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); gap: 10px; }
+  .item {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 10px 6px; text-align: center; cursor: pointer; transition: box-shadow .15s;
+    position: relative;
+  }
+  .item:hover { box-shadow: 0 2px 8px rgba(0,0,0,.08); border-color: var(--primary); }
+  .item:active { transform: translateY(1px); }
+  .item .icon { font-size: 22px; line-height: 1; display: block; margin-bottom: 6px; }
+  .item .no { font-size: 11px; color: var(--text-muted); }
+  .item .name { font-size: 12px; color: var(--text-muted); margin-top: 2px; word-break: break-all; }
+  .copied { position: absolute; top: 4px; right: 4px; font-size: 10px; color: var(--primary); background: #ddf4ff; padding: 2px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<h1>Craft 图标库</h1>
+<p class="hint">点击任意图标即可复制该符号，复制后告诉我编号，我直接替换到按钮上。</p>
+
+<script>
+const groups = [
+  {
+    title: '① 保存 / 确认',
+    items: [
+      { no:'A1', icon:'✓', name:'对勾' },
+      { no:'A2', icon:'✔', name:'粗对勾' },
+      { no:'A3', icon:'✅', name:'绿框对勾' },
+      { no:'A4', icon:'💾', name:'软盘' },
+      { no:'A5', icon:'🖫', name:'磁盘' },
+      { no:'A6', icon:'📥', name:'下载盒' },
+      { no:'A7', icon:'💾', name:'保存' },
+      { no:'A8', icon:'📝', name:'记录' },
+      { no:'A9', icon:'📌', name:'图钉' },
+      { no:'A10', icon:'📂', name:'打开文件夹' },
+    ]
+  },
+  {
+    title: '② 删除 / 清空',
+    items: [
+      { no:'B1', icon:'✕', name:'叉号' },
+      { no:'B2', icon:'✖', name:'粗叉号' },
+      { no:'B3', icon:'❌', name:'红叉' },
+      { no:'B4', icon:'🗑', name:'垃圾桶' },
+      { no:'B5', icon:'🗑️', name:'废纸篓' },
+      { no:'B6', icon:'🚫', name:'禁止' },
+      { no:'B7', icon:'⛔', name:'禁止通行' },
+      { no:'B8', icon:'❎', name:'叉方框' },
+      { no:'B9', icon:'🧹', name:'扫帚' },
+      { no:'B10', icon:'🗞', name:'废纸' },
+    ]
+  },
+  {
+    title: '③ 添加 / 新建',
+    items: [
+      { no:'C1', icon:'＋', name:'加号' },
+      { no:'C2', icon:'+', name:'英文加号' },
+      { no:'C3', icon:'➕', name:'粗加号' },
+      { no:'C4', icon:'✚', name:'十字' },
+      { no:'C5', icon:'✙', name:'十字圆' },
+      { no:'C6', icon:'🆕', name:'NEW' },
+      { no:'C7', icon:'📎', name:'回形针' },
+      { no:'C8', icon:'📝', name:'笔记' },
+      { no:'C9', icon:'📋', name:'剪贴板' },
+    ]
+  },
+  {
+    title: '④ 编辑 / 修改',
+    items: [
+      { no:'D1', icon:'✎', name:'铅笔' },
+      { no:'D2', icon:'✏', name:'铅笔2' },
+      { no:'D3', icon:'🖊', name:'圆珠笔' },
+      { no:'D4', icon:'🖋', name:'钢笔' },
+      { no:'D5', icon:'📝', name:'备忘录' },
+      { no:'D6', icon:'📐', name:'三角尺' },
+      { no:'D7', icon:'✐', name:'斜笔' },
+      { no:'D8', icon:'🔧', name:'扳手' },
+      { no:'D9', icon:'🔨', name:'锤子' },
+    ]
+  },
+  {
+    title: '⑤ 导入 / 导出',
+    items: [
+      { no:'E1', icon:'⤓', name:'导入' },
+      { no:'E2', icon:'⤒', name:'导出' },
+      { no:'E3', icon:'↓', name:'向下箭头' },
+      { no:'E4', icon:'↑', name:'向上箭头' },
+      { no:'E5', icon:'⬇', name:'粗下箭头' },
+      { no:'E6', icon:'⬆', name:'粗上箭头' },
+      { no:'E7', icon:'📤', name:'上传' },
+      { no:'E8', icon:'📥', name:'下载' },
+      { no:'E9', icon:'📦', name:'包裹' },
+    ]
+  },
+  {
+    title: '⑥ 转移 / 移动',
+    items: [
+      { no:'F1', icon:'⇄', name:'双向箭头' },
+      { no:'F2', icon:'↔', name:'水平双箭头' },
+      { no:'F3', icon:'➡', name:'右箭头' },
+      { no:'F4', icon:'⬅', name:'左箭头' },
+      { no:'F5', icon:'🔀', name:'随机' },
+      { no:'F6', icon:'🔄', name:'循环' },
+      { no:'F7', icon:'📂', name:'文件夹' },
+    ]
+  },
+  {
+    title: '⑦ 搜索 / 刷新',
+    items: [
+      { no:'G1', icon:'🔍', name:'放大镜' },
+      { no:'G2', icon:'🔎', name:'右放大镜' },
+      { no:'G3', icon:'🔄', name:'刷新' },
+      { no:'G4', icon:'↻', name:'顺时针' },
+      { no:'G5', icon:'⟳', name:'逆时针' },
+      { no:'G6', icon:'🔃', name:'垂直刷新' },
+    ]
+  },
+  {
+    title: '⑧ 设置 / 管理',
+    items: [
+      { no:'H1', icon:'⚙', name:'齿轮' },
+      { no:'H2', icon:'⚙️', name:'齿轮2' },
+      { no:'H3', icon:'🔧', name:'扳手' },
+      { no:'H4', icon:'🔨', name:'锤子' },
+      { no:'H5', icon:'🛠', name:'工具' },
+      { no:'H6', icon:'📊', name:'图表' },
+      { no:'H7', icon:'📈', name:'上升图' },
+      { no:'H8', icon:'🗂', name:'索引卡' },
+    ]
+  },
+  {
+    title: '⑨ 状态 / 提示',
+    items: [
+      { no:'I1', icon:'ℹ', name:'信息' },
+      { no:'I2', icon:'ℹ️', name:'信息2' },
+      { no:'I3', icon:'❗', name:'感叹号' },
+      { no:'I4', icon:'❕', name:'白感叹号' },
+      { no:'I5', icon:'⚠', name:'警告' },
+      { no:'I6', icon:'⚠️', name:'警告2' },
+      { no:'I7', icon:'✳', name:'星号' },
+      { no:'I8', icon:'✴', name:'四角星' },
+      { no:'I9', icon:'⭐', name:'星星' },
+      { no:'I10', icon:'🔔', name:'铃铛' },
+      { no:'I11', icon:'🔕', name:'静音' },
+      { no:'I12', icon:'💡', name:'灯泡' },
+    ]
+  },
+  {
+    title: '⑩ 文件 / 数据',
+    items: [
+      { no:'J1', icon:'📄', name:'文件' },
+      { no:'J2', icon:'📃', name:'卷页' },
+      { no:'J3', icon:'📑', name:'书签' },
+      { no:'J4', icon:'📋', name:'剪贴板' },
+      { no:'J5', icon:'🗒', name:'线圈本' },
+      { no:'J6', icon:'📁', name:'文件夹' },
+      { no:'J7', icon:'📂', name:'打开夹' },
+      { no:'J8', icon:'📦', name:'包裹' },
+      { no:'J9', icon:'🏷', name:'标签' },
+    ]
+  },
+];
+
+groups.forEach(g => {
+  const wrap = document.createElement('div');
+  wrap.className = 'category';
+  const h = document.createElement('h2');
+  h.className = 'cat-title';
+  h.textContent = g.title;
+  wrap.appendChild(h);
+  const grid = document.createElement('div');
+  grid.className = 'grid';
+  g.items.forEach(it => {
+    const el = document.createElement('div');
+    el.className = 'item';
+    el.innerHTML = `<span class="icon">${it.icon}</span><span class="no">${it.no}</span><div class="name">${it.name}</div>`;
+    el.addEventListener('click', () => {
+      navigator.clipboard.writeText(it.icon).catch(() => {});
+      const old = el.querySelector('.copied');
+      if (old) old.remove();
+      const tag = document.createElement('span');
+      tag.className = 'copied';
+      tag.textContent = '已复制';
+      el.appendChild(tag);
+      setTimeout(() => tag.remove(), 1200);
+    });
+    grid.appendChild(el);
+  });
+  wrap.appendChild(grid);
+  document.body.appendChild(wrap);
+});
+</script>
+</body>
+</html>

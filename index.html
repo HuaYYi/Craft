@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Craft 系统</title>
+  <link rel="stylesheet" href="assets/css/admin.css" />
+</head>
+<body>
+  <div class="layout">
+    <!-- 左侧导航 -->
+    <aside class="sidebar">
+      <div class="brand">Craft 系统</div>
+      <nav class="nav">
+        <a href="javascript:;" class="nav-item active" data-view="materials">物料及分组</a>
+        <a href="javascript:;" class="nav-item" data-view="settings">设置</a>
+        <a href="icons.html" class="nav-item" target="_blank" rel="noopener">图标库（临时）</a>
+      </nav>
+    </aside>
+
+    <!-- 右侧主区域 -->
+    <div class="main">
+      <header class="topbar">
+        <div class="topbar-title" id="topbarTitle">物料及分组</div>
+        <button class="btn primary commit-btn" id="commitLink">提交管理(0)</button>
+      </header>
+      <section class="content" id="content"></section>
+    </div>
+  </div>
+
+  <!-- 通用弹窗 -->
+  <div class="modal-mask hidden" id="modalMask">
+    <div class="modal" id="modal"></div>
+  </div>
+
+  <!-- Toast 容器 -->
+  <div class="toast-wrap" id="toastWrap"></div>
+
+  <!-- Excel 读写（本地内置，离线可用） -->
+  <script src="assets/vendor/xlsx.full.min.js"></script>
+  <script type="module" src="assets/js/app.js"></script>
+</body>
+</html>
