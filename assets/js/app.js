@@ -100,6 +100,7 @@ async function init() {
 
   state.settings = GH.getGithubSettings();
   bindNav();
+  bindInfoTips();
   await refreshRemote();
 
   if (localStorage.getItem(MODEL_KEY) !== MODEL_VERSION) {
@@ -1010,7 +1011,7 @@ function openImportPreview(rows, fileName) {
 // 板块1 分组属性：名称/排序/末级/描述
 // 板块2 本级属性值：直接父级定义的字段，本组填值（整组一份，不进物料档案）；父级没定义则不显示
 // 板块3 继承的属性：更高层祖先定义的字段，只读显示上级已填的值；没有则不显示
-// 板块4 字段定义：非末级=给下级分组添加属性（下级在「本级属性值」填值）；末级=物料属性（进物料档案）
+// 板块4 物料属性（字段定义）：非末级=下级自动继承（下级在「本级属性值」填值）；末级=进物料档案
 function buildManagePanel(cat) {
   const panel = mk('div', { class: 'tab-panel' });
   const body = mk('div', { class: 'materials-body' });
@@ -1033,8 +1034,9 @@ function buildManagePanel(cat) {
   leafChk.disabled = kids.length > 0;
   const leafWrap = mk('label', { class: 'checkbox-label' });
   leafWrap.appendChild(leafChk);
-  leafWrap.appendChild(document.createTextNode(
-    kids.length ? '末级分组（已有下一级分组，不可设为末级）' : '末级分组（勾选后可挂物料档案）'));
+  leafWrap.appendChild(document.createTextNode('末级分组'));
+  leafWrap.appendChild(infoTip(
+    kids.length ? '已有下一级分组，不可设为末级' : '勾选后可挂物料档案'));
 
   formGrid.appendChild(fieldBox('名称', nameInput));
   formGrid.appendChild(fieldBox('排序', sortInput));
@@ -1091,18 +1093,21 @@ function buildManagePanel(cat) {
     formCol.appendChild(s);
   }
 
-  // 字段定义（非末级 → 下级分组自动继承；末级 → 物料属性，进物料档案）
+  // 字段定义（非末级 → 下级自动继承；末级 → 进物料档案）
   const s3 = mk('div', { class: 'section' });
-  if (cat.isLeaf) {
-    s3.appendChild(sectionTitle(++secIdx, '物料属性', '末级分组才有的字段：进入物料档案的列和新增/编辑表单，每个物料各自填值'));
-  } else {
-    s3.appendChild(sectionTitle(++secIdx, '给下级分组添加属性', '定义一次，所有下级分组自动拥有，在各自的分组管理里填值；不进物料档案'));
-  }
+  s3.appendChild(sectionTitle(++secIdx, '物料属性',
+    cat.isLeaf
+      ? '末级分组的字段：进入物料档案的列和新增/编辑表单，每个物料各自填值'
+      : '定义一次，所有下级分组自动拥有，在各下级的分组管理里填值；不进物料档案'));
 
   // 属性集合：一套属性模板，套用后本组字段由集合实时提供
   let pendingDetach = false;
+  const linkedSet = state.attrSets.find(s => s.id === cat.attrSetId) || null;
   const setRow = mk('div', { class: 'assign-row' });
   setRow.appendChild(mk('label', {}, '属性集合'));
+  setRow.appendChild(infoTip(linkedSet
+    ? `下表灰色行来自「${linkedSet.name}」，只读；要改请到「系统设置 → 属性集合」。白色行是本组额外字段。关联新集合会替换本组字段并清理已填的值（保存时会弹窗确认）。`
+    : '关联集合会用集合字段替换本组现有字段，并清理这些字段已填的值（保存时会弹窗确认）。'));
   const setSelect = mk('select');
   setSelect.appendChild(mk('option', { value: '' }, '（不关联）'));
   for (const s of state.attrSets) {
@@ -1117,7 +1122,6 @@ function buildManagePanel(cat) {
   }
   setRow.appendChild(setSelect);
 
-  const linkedSet = state.attrSets.find(s => s.id === cat.attrSetId) || null;
   if (linkedSet) {
     setRow.appendChild(mk('span', { class: 'from-tag' }, '实时关联：改集合会影响所有关联分组'));
     const detachBtn = mk('button', { class: 'btn small', type: 'button' }, '脱离关联（复制一份）');
@@ -1129,10 +1133,6 @@ function buildManagePanel(cat) {
     setRow.appendChild(detachBtn);
   }
   s3.appendChild(setRow);
-  s3.appendChild(mk('div', { class: 'hint' },
-    linkedSet
-      ? `下表灰色行来自「${linkedSet.name}」，只读；要改请到「系统设置 → 属性集合」。白色行是本组额外字段。关联新集合会替换本组字段并清理已填的值（保存时会弹窗确认）。`
-      : '关联集合会用集合字段替换本组现有字段，并清理这些字段已填的值（保存时会弹窗确认）。'));
 
   // 集合字段与本组自有字段放在同一张表里，集合行只读
   const attrTable = renderAttrDefTable(cat.attrs || [], state.dictionaries, linkedSet?.attrs || []);
@@ -1436,8 +1436,55 @@ function sectionTitle(idx, text, sub) {
   const h = mk('div', { class: 'section-title' });
   h.appendChild(mk('span', { class: 'idx' }, String(idx)));
   h.appendChild(document.createTextNode(text));
-  if (sub) h.appendChild(mk('span', { class: 'sub' }, sub));
+  if (sub) h.appendChild(infoTip(sub));
   return h;
+}
+
+// 说明文字统一收进「!」图标，悬浮才显示，避免版面被小字提示占满
+function infoTip(text) {
+  return mk('span', { class: 'info-tip', 'data-tip': text, 'aria-label': text }, '!');
+}
+
+// 提示浮层挂在 body 上用 fixed 定位：面板是可滚动容器，放在里面会被裁剪
+let _tipEl = null;
+
+function bindInfoTips() {
+  document.addEventListener('mouseover', (e) => {
+    const icon = e.target.closest && e.target.closest('.info-tip');
+    if (icon) showInfoTip(icon);
+  });
+  document.addEventListener('mouseout', (e) => {
+    if (e.target.closest && e.target.closest('.info-tip')) hideInfoTip();
+  });
+  window.addEventListener('scroll', hideInfoTip, true);
+  window.addEventListener('resize', hideInfoTip);
+}
+
+function showInfoTip(icon) {
+  hideInfoTip();
+  const text = icon.getAttribute('data-tip');
+  if (!text) return;
+  const el = mk('div', { class: 'info-tip-pop' }, text);
+  document.body.appendChild(el);
+
+  const pad = 8;
+  const r = icon.getBoundingClientRect();
+  const w = el.offsetWidth;
+  const h = el.offsetHeight;
+  // 水平居中在图标下方，超出视口就夹紧
+  let left = r.left + r.width / 2 - w / 2;
+  left = Math.max(pad, Math.min(left, window.innerWidth - w - pad));
+  // 下方放不下就翻到上方
+  let top = r.bottom + 6;
+  if (top + h > window.innerHeight - pad) top = Math.max(pad, r.top - h - 6);
+
+  el.style.left = `${left}px`;
+  el.style.top = `${top}px`;
+  _tipEl = el;
+}
+
+function hideInfoTip() {
+  if (_tipEl) { _tipEl.remove(); _tipEl = null; }
 }
 
 function fieldBox(label, input) {
