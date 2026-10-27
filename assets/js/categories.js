@@ -53,7 +53,8 @@ export function categoryPathNames(categories, id) {
 }
 
 export function categoryPathString(categories, id) {
-  return categoryPathNames(categories, id).join(' / ');
+  // 用反斜杠分隔：分组名本身可能含 /，正斜杠留给名称使用
+  return categoryPathNames(categories, id).join(' \\ ');
 }
 
 // 所有后代 id（含自身）
@@ -85,13 +86,84 @@ export function effectiveValues(categories, id) {
   return merged;
 }
 
-// 属性值 → 显示文本（数组用 / 连接，range 用 ~ 连接，checkbox 显示 是/否）
+// 分组生效的属性定义 = 关联的属性集合字段 + 本组自有字段（同名 key 本组覆盖）
+// attrSetId 为空的旧分组直接用自有字段
+export function withAttrSet(cat, attrSets) {
+  const set = attrSets?.find(s => s.id === cat?.attrSetId);
+  return [...(set?.attrs || []), ...(cat?.attrs || [])];
+}
+
+// 把字段定义里的 dictId 解析成 options / optionsLabels，供 renderForm 使用
+export function applyDictionaries(defs, dictionaries) {
+  return defs.map(def => {
+    if (!def.dictId) return def;
+    const dict = (dictionaries || []).find(d => d.id === def.dictId);
+    if (!dict) return def;
+    return {
+      ...def,
+      options: dict.items.map(i => i.value),
+      optionsLabels: Object.fromEntries(dict.items.map(i => [i.value, i.label || i.value])),
+    };
+  });
+}
+
+// 属性值 → 显示文本（字典项显示显示名；数组用 / 连接，range 用 ~ 连接，checkbox 显示 是/否）
 export function fmtAttrValue(def, v) {
   if (v == null || v === '' || (Array.isArray(v) && !v.length)) return '';
-  if (Array.isArray(v)) return v.join('/');
+  if (Array.isArray(v)) return v.map(x => def.optionsLabels?.[x] || x).join('/');
   if (def.type === 'range') return `${v.min ?? ''}~${v.max ?? ''}`;
   if (def.type === 'checkbox') return v ? '是' : '否';
-  return String(v);
+  return def.optionsLabels?.[v] || String(v);
+}
+
+// 显示名 → 存储值（Excel 里导出的是显示名，导入时要转回存储值）
+export function attrValueFromDisplay(def, raw) {
+  if (!def.optionsLabels || raw == null) return raw;
+  const rev = new Map(Object.entries(def.optionsLabels).map(([v, l]) => [String(l), v]));
+  const toValue = (s) => {
+    const t = String(s).trim();
+    return rev.has(t) ? rev.get(t) : t;
+  };
+  if (def.type === 'multiselect') return String(raw).split(/[/、,，]/).map(toValue).filter(Boolean);
+  return toValue(raw);
+}
+
+// 显示文本 → 属性值（Excel 导入用，与 fmtAttrValue 互为反向）
+// 解析不出来（空值/格式不符）时返回 undefined，调用方跳过该字段
+export function parseAttrValue(def, raw) {
+  if (raw == null) return undefined;
+  const s = String(raw).trim();
+  if (s === '') return undefined;
+  switch (def.type) {
+    case 'number': {
+      const n = Number(s);
+      return Number.isNaN(n) ? undefined : n;
+    }
+    case 'checkbox': {
+      const yes = ['是', 'true', 'TRUE', 'True', '1', '✓'];
+      const no = ['否', 'false', 'FALSE', 'False', '0'];
+      if (yes.includes(s)) return true;
+      if (no.includes(s)) return false;
+      return undefined;
+    }
+    case 'multiselect': {
+      const arr = Array.isArray(raw)
+        ? raw.map(x => String(x).trim())
+        : String(raw).split(/[/、,，]/).map(x => x.trim());
+      return arr.filter(Boolean);
+    }
+    case 'range': {
+      const parts = s.split(/[~～]/).map(x => x.trim());
+      if (parts.length !== 2) return undefined;
+      const min = parts[0] === '' ? '' : Number(parts[0]);
+      const max = parts[1] === '' ? '' : Number(parts[1]);
+      if (Number.isNaN(min) || Number.isNaN(max)) return undefined;
+      if (min === '' && max === '') return undefined;
+      return { min, max };
+    }
+    default:
+      return s;
+  }
 }
 
 // 按名称路径解析分组，返回叶子分组；不存在则按需创建

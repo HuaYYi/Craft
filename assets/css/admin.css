@@ -209,9 +209,35 @@ table.grid th {
   font-size: 12px;
   position: sticky; top: 0; z-index: 2;
 }
-table.grid tbody tr:hover td { background: #fafbfc; }
+table.grid td {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+table.grid tr:hover td { background: #fafbfc; }
 table.grid td.wrap { white-space: normal; min-width: 160px; max-width: 320px; }
-table.grid td.mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; color: var(--text-muted); }
+
+/* 物料档案：编码 / 名称固定在左，操作固定在右，中间属性列横向滚动
+   （class 由 renderMaterialsTable 标注，left 偏移在渲染后按实际列宽计算） */
+table.grid th.col-chk, table.grid td.col-chk,
+table.grid th.col-code, table.grid td.col-code,
+table.grid th.col-name, table.grid td.col-name,
+table.grid th.col-ops, table.grid td.col-ops { position: sticky; z-index: 3; background: var(--surface); }
+table.grid th.col-chk, table.grid td.col-chk { left: 0; width: 36px; }
+table.grid th.col-code, table.grid td.col-code {
+  width: 140px; max-width: 140px; overflow: hidden; text-overflow: ellipsis;
+}
+table.grid th.col-name, table.grid td.col-name {
+  width: 200px; max-width: 200px; overflow: hidden; text-overflow: ellipsis;
+  box-shadow: 1px 0 0 var(--border);
+}
+table.grid th.col-ops, table.grid td.col-ops {
+  right: 0; box-shadow: -1px 0 0 var(--border);
+}
+table.grid th.col-chk, table.grid th.col-code, table.grid th.col-name,
+table.grid th.col-ops { background: #fafbfc; z-index: 4; }
+table.grid tr:hover td.col-chk, table.grid tr:hover td.col-code,
+table.grid tr:hover td.col-name, table.grid tr:hover td.col-ops { background: #fafbfc; }
 
 /* 行内文字操作按钮（编辑 / 删除） */
 .link-btn {
@@ -303,6 +329,7 @@ tr.dirty td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
 }
 .form-grid textarea { resize: vertical; }
 .form-grid input:disabled, .form-grid select:disabled { background: var(--bg); color: var(--text-muted); }
+.form-grid input[readonly] { background: var(--bg); color: var(--text-muted); }
 
 .checkbox-label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
 .radio-group, .checkbox-group { display: flex; flex-wrap: wrap; gap: 12px; }
@@ -355,7 +382,22 @@ tr.dirty td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
   padding: 4px 8px; border: 1px solid var(--border-strong); border-radius: 4px;
   font-size: 13px; width: 100%;
 }
-.chk-inline { font-size: 13px; display: inline-flex; gap: 4px; align-items: center; }
+/* 必填/唯一 单元格里只有一个勾选框，不参与拉伸和内边距 */
+.field-editor-table input[type="checkbox"] { width: auto; padding: 0; border: 0; }
+
+/* 行拖动排序：拖手柄调整属性顺序 */
+.field-editor-table th.col-drag, .field-editor-table td.col-drag {
+  width: 26px; min-width: 26px; padding: 0; text-align: center;
+}
+.drag-handle {
+  display: inline-block; padding: 4px 2px; cursor: grab;
+  color: #b6bfca; font-size: 15px; line-height: 1; user-select: none;
+}
+.drag-handle:hover { color: var(--text-muted); }
+.drag-handle:active { cursor: grabbing; }
+.field-editor-table tr.row-dragging { opacity: .4; }
+.field-editor-table tr.drop-above td { box-shadow: inset 0 2px 0 var(--primary); }
+.field-editor-table tr.drop-below td { box-shadow: inset 0 -2px 0 var(--primary); }
 
 /* ========= 设置页 ========= */
 .settings-form { max-width: 460px; display: flex; flex-direction: column; gap: 14px; }
@@ -366,6 +408,50 @@ tr.dirty td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
   font-size: 13px;
 }
 .settings-form .hint { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+.hint { font-size: 12px; color: var(--text-muted); }
+
+/* 系统设置：子标签 */
+.subtabs { display: flex; gap: 4px; margin-bottom: 14px; }
+.subtab {
+  padding: 6px 12px; font-size: 13px; cursor: pointer;
+  border: 1px solid var(--border-strong); background: #fff; border-radius: var(--radius);
+  color: var(--text-muted);
+}
+.subtab:hover { background: var(--hover); }
+.subtab.active { color: var(--primary); border-color: var(--primary); font-weight: 600; }
+
+/* 系统设置：字典 / 属性集合卡片 */
+.setting-block { display: flex; flex-direction: column; gap: 14px; max-width: 860px; }
+.dict-card { border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; }
+.dict-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.dict-name { flex: 1; max-width: 260px; padding: 6px 10px; font-size: 13px;
+  border: 1px solid var(--border-strong); border-radius: var(--radius); }
+.dict-items { display: flex; flex-direction: column; gap: 6px; }
+.dict-item-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; align-items: center; }
+.dict-item-row input { padding: 5px 8px; font-size: 13px;
+  border: 1px solid var(--border-strong); border-radius: 4px; }
+.dict-item-head { font-size: 12px; }
+.dict-actions { display: flex; gap: 8px; margin-top: 10px; }
+
+/* 分组管理：属性集合关联 */
+.assign-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+.assign-row label { font-size: 13px; color: var(--text-muted); min-width: 60px; }
+.assign-row select { padding: 5px 8px; font-size: 13px; border: 1px solid var(--border-strong); border-radius: 4px; }
+/* 来自属性集合的字段行：只读，灰底 */
+.field-editor-table tr.row-readonly { background: #f7f8fa; }
+.field-editor-table tr.row-readonly input,
+.field-editor-table tr.row-readonly select { color: var(--text-muted); background: transparent; border-color: var(--border); }
+
+/* 复制分组弹窗 */
+.copy-form { display: flex; flex-direction: column; gap: 6px; }
+.copy-form > label { font-size: 12px; color: var(--text-muted); margin-top: 6px; }
+.copy-form input[type="text"], .copy-form select {
+  padding: 6px 10px; font-size: 13px;
+  border: 1px solid var(--border-strong); border-radius: 4px;
+}
+.copy-modes { display: flex; flex-direction: column; gap: 6px; padding: 6px 0; }
+.copy-mode { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
+.copy-mode input:disabled + span { color: var(--text-muted); }
 
 /* ========= 提交管理 ========= */
 .commit-list { list-style: none; padding: 0; margin: 0; }

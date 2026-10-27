@@ -12,13 +12,13 @@
 //
 // 视图：materials（物料及分组） / settings（设置） / commit（提交管理）
 
-import { CONFIG, LOCATION } from './config.js';
+import { CONFIG, LOCATION, FIELD_TYPES } from './config.js';
 import * as Store from './store.js';
 import * as GH from './github.js';
 import * as Cat from './categories.js';
 import * as Excel from './excel.js';
 import { renderForm, renderAttrDefTable, mk } from './fields.js';
-import { openModal, closeModal, toastOk, toastErr, confirm } from './ui.js';
+import { openModal, closeModal, toastOk, toastErr, confirm, toast } from './ui.js';
 
 // ---------- 全局状态 ----------
 const state = {
@@ -26,11 +26,17 @@ const state = {
   // 远端基准（未应用草稿）
   baseCategories: [],
   baseMaterials: [],
+  baseDictionaries: [],
+  baseAttrSets: [],
   rawCategoriesText: '',
   rawMaterialsText: '',
+  rawDictionariesText: '',
+  rawAttrSetsText: '',
   // 应用草稿后的展示数据
   categories: [],
   materials: [],
+  dictionaries: [],
+  attrSets: [],
   drafts: [],
   settings: null,
   pat: '',
@@ -46,8 +52,38 @@ const state = {
 
 const mint = (prefix) => `${prefix}_${crypto.randomUUID().slice(0, 8)}`;
 const nowISO = () => new Date().toISOString();
+
+// 物料编码自动生成：年月日 + 四位流水号（如 202610270001）
+// 当天已用过的序号往后顺延；草稿里的新物料也算在内，避免重复
+function nextMaterialCode() {
+  const d = new Date();
+  const prefix = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+  const used = new Set();
+  for (const m of state.materials) {
+    const code = String(m.code || '');
+    if (!code.startsWith(prefix)) continue;
+    const seq = Number(code.slice(prefix.length));
+    if (Number.isInteger(seq) && seq > 0) used.add(seq);
+  }
+  let seq = 1;
+  while (used.has(seq)) seq++;
+  return prefix + String(seq).padStart(4, '0');
+}
 const clone = (v) => JSON.parse(JSON.stringify(v));
 const UNGROUPED = '';          // 未分组的 categoryId
+
+// 四份数据文件，统一按「草稿 → 提交」处理
+const DATA_SETS = [
+  { kind: 'category',   path: CONFIG.categoriesPath,   base: 'baseCategories',   live: 'categories',   raw: 'rawCategoriesText' },
+  { kind: 'material',   path: CONFIG.materialsPath,    base: 'baseMaterials',    live: 'materials',    raw: 'rawMaterialsText' },
+  { kind: 'dictionary', path: CONFIG.dictionariesPath, base: 'baseDictionaries', live: 'dictionaries', raw: 'rawDictionariesText' },
+  { kind: 'attrSet',    path: CONFIG.attrSetsPath,     base: 'baseAttrSets',     live: 'attrSets',     raw: 'rawAttrSetsText' },
+];
+
+// 分组的生效属性定义（集合字段 + 自有字段）
+const attrsOf = (cat) => Cat.withAttrSet(cat, state.attrSets);
+// 字段定义补上字典选项，交给表单渲染
+const fieldsOf = (defs) => Cat.applyDictionaries(defs, state.dictionaries);
 
 // ---------- 启动 ----------
 init().catch(e => {
@@ -85,7 +121,7 @@ function switchView(view) {
   state.view = view;
   document.querySelectorAll('.nav-item').forEach(i => i.classList.toggle('active', i.dataset.view === view));
   document.getElementById('commitLink').classList.toggle('active', view === 'commit');
-  const titles = { materials: '物料及分组', settings: '设置', commit: '提交管理' };
+  const titles = { materials: '物料及分组', settings: '系统设置', commit: '提交管理' };
   document.getElementById('topbarTitle').textContent = titles[view] || '';
   render();
 }
@@ -104,29 +140,32 @@ async function refreshRemote() {
   GH.setToken(state.pat);
   setLoading();
   try {
-    let catsText = null;
-    let matsText = null;
+    const texts = {};
 
     if (state.pat) {
       try {
         state.remoteHead = await GH.getBranchHead(state.settings.branch);
       } catch (_) { state.remoteHead = null; }
-      const cf = await GH.getFile(CONFIG.categoriesPath);
-      const mf = await GH.getFile(CONFIG.materialsPath);
-      if (cf) catsText = cf.content;
-      if (mf) matsText = mf.content;
+      for (const s of DATA_SETS) {
+        const f = await GH.getFile(s.path);
+        texts[s.kind] = f ? f.content : null;
+      }
     } else {
       state.remoteHead = null;
-      const rc = await fetch(CONFIG.categoriesPath);
-      if (rc.ok) catsText = await rc.text();
-      const rm = await fetch(CONFIG.materialsPath);
-      if (rm.ok) matsText = await rm.text();
+      for (const s of DATA_SETS) {
+        try {
+          const r = await fetch(s.path);
+          texts[s.kind] = r.ok ? await r.text() : null;
+        } catch (_) {
+          texts[s.kind] = null;
+        }
+      }
     }
 
-    state.baseCategories = catsText ? safeParse(catsText, []) : [];
-    state.baseMaterials = matsText ? safeParse(matsText, []) : [];
-    state.rawCategoriesText = catsText || '[]';
-    state.rawMaterialsText = matsText || '[]';
+    for (const s of DATA_SETS) {
+      state[s.base] = texts[s.kind] ? safeParse(texts[s.kind], []) : [];
+      state[s.raw] = texts[s.kind] || '[]';
+    }
   } catch (e) {
     console.warn('远端读取失败', e);
     toastErr('远端同步失败：' + (e.message || e));
@@ -145,11 +184,12 @@ async function loadDrafts() {
 }
 
 function applyDrafts() {
-  const cats = clone(state.baseCategories);
-  const mats = clone(state.baseMaterials);
+  const sets = {};
+  for (const s of DATA_SETS) sets[s.kind] = clone(state[s.base]);
 
   for (const d of state.drafts) {
-    const target = d.kind === 'category' ? cats : mats;
+    const target = sets[d.kind];
+    if (!target) continue;
     const idx = target.findIndex(x => x.id === d.recordId);
     if (d.op === 'delete') {
       if (idx >= 0) target.splice(idx, 1);
@@ -161,11 +201,10 @@ function applyDrafts() {
     }
   }
 
-  state.categories = cats;
-  state.materials = mats;
+  for (const s of DATA_SETS) state[s.live] = sets[s.kind];
 
   // 选中分组若被删掉则回退到未分组
-  if (state.selectedCategoryId !== UNGROUPED && !cats.some(c => c.id === state.selectedCategoryId)) {
+  if (state.selectedCategoryId !== UNGROUPED && !state.categories.some(c => c.id === state.selectedCategoryId)) {
     state.selectedCategoryId = UNGROUPED;
   }
 }
@@ -192,6 +231,28 @@ async function saveMaterialDraft(mat, op) {
     recordId: mat.id,
     op,
     data: clone(mat),
+  });
+  await loadDrafts();
+}
+
+async function saveDictionaryDraft(dict, op) {
+  await Store.putDraft({
+    id: `dictionary:${dict.id}`,
+    kind: 'dictionary',
+    recordId: dict.id,
+    op,
+    data: clone(dict),
+  });
+  await loadDrafts();
+}
+
+async function saveAttrSetDraft(set, op) {
+  await Store.putDraft({
+    id: `attrSet:${set.id}`,
+    kind: 'attrSet',
+    recordId: set.id,
+    op,
+    data: clone(set),
   });
   await loadDrafts();
 }
@@ -463,6 +524,10 @@ function currentMaterials() {
       (m.code || '').toLowerCase().includes(kw) ||
       (m.name || '').toLowerCase().includes(kw));
   }
+  // 按物料编码自然排序：草稿是按键名（内部 ID）取回的，顺序本身是随机的，
+  // 不显式排序会导致列表/导出顺序错乱
+  list = [...list].sort((a, b) =>
+    String(a.code || '').localeCompare(String(b.code || ''), 'zh', { numeric: true }));
   return list;
 }
 
@@ -554,27 +619,29 @@ function renderMaterialsTable(wrap, cat, info) {
     render();
   });
 
-  // 物料属性列：当前可见物料所属末级分组定义的字段并集，每个属性单独一列
+  // 物料属性列：当前可见物料所属末级分组生效字段的并集，每个属性单独一列
   const attrDefs = [];
   const seenKeys = new Set();
   for (const m of list) {
     if (!m.categoryId) continue;
     const cat = Cat.findCategory(state.categories, m.categoryId);
-    for (const def of cat?.attrs || []) {
+    for (const def of fieldsOf(attrsOf(cat))) {
       if (!seenKeys.has(def.key)) { seenKeys.add(def.key); attrDefs.push(def); }
     }
   }
 
-  const thChk = mk('th', { style: 'width:32px;' });
+  const thChk = mk('th', { class: 'col-chk' });
   thChk.appendChild(chkAll);
   head.appendChild(thChk);
-  ['ID', '物料编码', '物料名称', ...attrDefs.map(d => d.label), '位置', '最近编辑'].forEach(t => head.appendChild(mk('th', {}, t)));
-  head.appendChild(mk('th', {}, '操作'));
+  const headLabels = ['物料编码', '物料名称', ...attrDefs.map(d => d.label), '位置', '最近编辑'];
+  const headClasses = ['col-code', 'col-name', ...attrDefs.map(() => 'col-attr'), 'col-attr', 'col-attr'];
+  headLabels.forEach((t, i) => head.appendChild(mk('th', { class: headClasses[i] }, t)));
+  head.appendChild(mk('th', { class: 'col-ops' }, '操作'));
   table.appendChild(head);
 
   if (!list.length) {
     const tr = mk('tr');
-    tr.appendChild(mk('td', { colspan: attrDefs.length + 7, class: 'empty' }, '暂无物料'));
+    tr.appendChild(mk('td', { colspan: attrDefs.length + 6, class: 'empty' }, '暂无物料'));
     table.appendChild(tr);
   }
 
@@ -582,7 +649,7 @@ function renderMaterialsTable(wrap, cat, info) {
     const d = draftOf('material', m.id);
     const tr = mk('tr', { class: d ? 'dirty' : '' });
 
-    const tdChk = mk('td');
+    const tdChk = mk('td', { class: 'col-chk' });
     const chk = mk('input', { type: 'checkbox' });
     chk.checked = state.checked.has(m.id);
     chk.addEventListener('change', () => {
@@ -592,21 +659,20 @@ function renderMaterialsTable(wrap, cat, info) {
     tdChk.appendChild(chk);
     tr.appendChild(tdChk);
 
-    tr.appendChild(mk('td', { class: 'mono' }, m.id.slice(-8)));
-    tr.appendChild(mk('td', { class: 'mono' }, m.code || ''));
-    tr.appendChild(mk('td', {}, m.name || ''));
+    tr.appendChild(mk('td', { class: 'col-code' }, m.code || ''));
+    tr.appendChild(mk('td', { class: 'col-name' }, m.name || ''));
     for (const def of attrDefs) {
-      tr.appendChild(mk('td', { class: 'wrap' }, Cat.fmtAttrValue(def, m.attrs?.[def.key])));
+      tr.appendChild(mk('td', { class: 'wrap col-attr' }, Cat.fmtAttrValue(def, m.attrs?.[def.key])));
     }
-    const locTd = mk('td');
+    const locTd = mk('td', { class: 'col-attr' });
     locTd.appendChild(buildLocationCell(m));
     tr.appendChild(locTd);
 
-    const editTd = mk('td', { class: 'muted', style: 'font-size:12px;' },
+    const editTd = mk('td', { class: 'muted col-attr', style: 'font-size:12px;' },
       fmtTime(m.updatedAt || m.createdAt));
     tr.appendChild(editTd);
 
-    const opsTd = mk('td', { style: 'white-space:nowrap;' });
+    const opsTd = mk('td', { class: 'col-ops' });
     const editBtn = mk('button', { class: 'link-btn' }, '编辑');
     editBtn.addEventListener('click', () => openMaterialDialog(m));
     const delBtn = mk('button', { class: 'link-btn danger' }, '删除');
@@ -619,6 +685,24 @@ function renderMaterialsTable(wrap, cat, info) {
   }
 
   wrap.appendChild(table);
+
+  // 固定列偏移：勾选框列宽 + 编码列宽 → 「物料名称」的 left
+  const pinColumns = () => {
+    const chk = table.querySelector('th.col-chk');
+    const code = table.querySelector('th.col-code');
+    if (!chk || !code) return;
+    const left1 = chk.offsetWidth;
+    const left2 = left1 + code.offsetWidth;
+    table.querySelectorAll('.col-code').forEach(el => { el.style.left = `${left1}px`; });
+    table.querySelectorAll('.col-name').forEach(el => { el.style.left = `${left2}px`; });
+  };
+  pinColumns();
+  requestAnimationFrame(pinColumns);
+  if (wrap._pinObserver) wrap._pinObserver.disconnect();
+  if (window.ResizeObserver) {
+    wrap._pinObserver = new ResizeObserver(() => pinColumns());
+    wrap._pinObserver.observe(wrap);
+  }
 }
 
 // 位置：云端=淡绿圆点（与云端一致），本地=灰圆点（有未提交的本地改动）
@@ -650,12 +734,13 @@ function openMaterialDialog(mat) {
   const catId = mat ? (mat.categoryId || UNGROUPED) : (state.selectedCategoryId || UNGROUPED);
   const cat = catId ? Cat.findCategory(state.categories, catId) : null;
   // 只有末级分组自己定义的字段才进物料表单（上级定义的字段在分组上统一填，不进物料档案）
-  const defs = cat?.attrs || [];
+  // 末级分组的生效字段（属性集合 + 自有字段），选项来自字典
+  const defs = fieldsOf(attrsOf(cat));
 
   let current = mat
     ? clone(mat)
     : {
-        id: mint('m'), categoryId: catId || UNGROUPED, code: '', name: '',
+        id: mint('m'), categoryId: catId || UNGROUPED, code: nextMaterialCode(), name: '',
         attrs: {}, location: 'local', syncedAt: '',
         createdAt: nowISO(), updatedAt: nowISO(), createdBy: '', updatedBy: '',
       };
@@ -663,13 +748,22 @@ function openMaterialDialog(mat) {
   const body = mk('div');
 
   const fields = [
-    { key: 'code', label: '物料编码', type: 'text', required: true, placeholder: '如 120201501' },
+    { key: 'code', label: '物料编码', type: 'text', required: true },
     { key: 'name', label: '物料名称', type: 'text', required: true },
     ...defs,
   ];
   const flat = { code: current.code, name: current.name, ...(current.attrs || {}) };
   const form = renderForm({ fields }, { fields: flat });
   body.appendChild(form.root);
+
+  // 物料编码由系统生成，不允许手改
+  const codeInput = form.root.querySelector('#f-code');
+  if (codeInput) {
+    codeInput.readOnly = true;
+    codeInput.title = '按「年月日 + 四位流水号」自动生成';
+  }
+  body.appendChild(mk('div', { class: 'muted', style: 'margin-top:6px;font-size:12px;' },
+    '物料编码按「年月日 + 四位流水号」自动生成'));
 
   // 位置信息（只读）：有未提交草稿=本地，与云端一致=云端
   const locLine = mk('div', { class: 'muted', style: 'margin-top:12px;font-size:12px;' });
@@ -801,7 +895,7 @@ function doExport() {
   try {
     // 物料位置按同步状态推导：有未提交草稿=本地
     const rows = list.map(m => ({ ...m, location: draftOf('material', m.id) ? 'local' : 'cloud' }));
-    const n = Excel.exportMaterials(rows, state.categories);
+    const n = Excel.exportMaterials(rows, state.categories, state.attrSets, state.dictionaries);
     toastOk(`已导出 ${n} 条物料`);
   } catch (e) {
     toastErr('导出失败：' + (e.message || e));
@@ -848,7 +942,15 @@ function openImportPreview(rows, fileName) {
 
     const targetCatId = categoryId;
 
-    // 导入只锁定分组路径；属性（分组级/物料级）都在页面里维护
+    // 属性列按「显示名 = 字段定义 label」匹配；分组级属性在分组上维护，不在这里读
+    const importCat = Cat.findCategory(cats, targetCatId);
+    const importedAttrs = {};
+    for (const def of fieldsOf(attrsOf(importCat))) {
+      const raw = row.raw?.[def.label];
+      const parsed = Cat.parseAttrValue(def, Cat.attrValueFromDisplay(def, raw));
+      if (parsed !== undefined) importedAttrs[def.key] = parsed;
+    }
+
     const data = {
       ...(existing || {
         id: row.id || mint('m'),
@@ -858,6 +960,8 @@ function openImportPreview(rows, fileName) {
       categoryId: targetCatId,
       code: row.code || existing?.code || '',
       name: row.name || existing?.name || '',
+      // Excel 里有值的属性覆盖，Excel 为空的保留原值（避免把已有数据清空）
+      attrs: { ...(existing?.attrs || {}), ...importedAttrs },
       updatedAt: nowISO(),
     };
     if (existing) plan.updates.push({ existing, data });
@@ -946,12 +1050,12 @@ function buildManagePanel(cat) {
   let secIdx = 1;
   const chain = Cat.categoryPath(state.categories, cat.id).slice(0, -1); // 祖先链，根在前
   const directParent = chain[chain.length - 1] || null;
-  const parentDefs = (directParent?.attrs || []).map(a => ({ ...a, fromCategory: directParent.name }));
+  const parentDefs = fieldsOf(attrsOf(directParent)).map(a => ({ ...a, fromCategory: directParent.name }));
   const parentKeys = new Set(parentDefs.map(a => a.key));
   // 更高层祖先的字段：同 key 就近覆盖；直接父级已定义的（归本级属性值）不重复显示
   const ancestorDefMap = new Map();
   for (const anc of chain.slice(0, -1)) {
-    for (const a of anc.attrs || []) {
+    for (const a of fieldsOf(attrsOf(anc))) {
       if (!parentKeys.has(a.key)) ancestorDefMap.set(a.key, { ...a, fromCategory: anc.name });
     }
   }
@@ -994,7 +1098,44 @@ function buildManagePanel(cat) {
   } else {
     s3.appendChild(sectionTitle(++secIdx, '给下级分组添加属性', '定义一次，所有下级分组自动拥有，在各自的分组管理里填值；不进物料档案'));
   }
-  const attrTable = renderAttrDefTable(cat.attrs || []);
+
+  // 属性集合：一套属性模板，套用后本组字段由集合实时提供
+  let pendingDetach = false;
+  const setRow = mk('div', { class: 'assign-row' });
+  setRow.appendChild(mk('label', {}, '属性集合'));
+  const setSelect = mk('select');
+  setSelect.appendChild(mk('option', { value: '' }, '（不关联）'));
+  for (const s of state.attrSets) {
+    const o = mk('option', { value: s.id }, `${s.name}（${s.attrs.length} 个属性）`);
+    if (cat.attrSetId === s.id) o.selected = true;
+    setSelect.appendChild(o);
+  }
+  if (cat.attrSetId && !state.attrSets.some(s => s.id === cat.attrSetId)) {
+    const o = mk('option', { value: cat.attrSetId }, '（集合已删除）');
+    o.selected = true;
+    setSelect.appendChild(o);
+  }
+  setRow.appendChild(setSelect);
+
+  const linkedSet = state.attrSets.find(s => s.id === cat.attrSetId) || null;
+  if (linkedSet) {
+    setRow.appendChild(mk('span', { class: 'from-tag' }, '实时关联：改集合会影响所有关联分组'));
+    const detachBtn = mk('button', { class: 'btn small', type: 'button' }, '脱离关联（复制一份）');
+    detachBtn.addEventListener('click', () => {
+      pendingDetach = true;
+      setSelect.value = '';
+      toast('已改为脱离：集合字段会复制为本组自有字段，点右侧 ✓ 保存后生效');
+    });
+    setRow.appendChild(detachBtn);
+  }
+  s3.appendChild(setRow);
+  s3.appendChild(mk('div', { class: 'hint' },
+    linkedSet
+      ? `下表灰色行来自「${linkedSet.name}」，只读；要改请到「系统设置 → 属性集合」。白色行是本组额外字段。关联新集合会替换本组字段并清理已填的值（保存时会弹窗确认）。`
+      : '关联集合会用集合字段替换本组现有字段，并清理这些字段已填的值（保存时会弹窗确认）。'));
+
+  // 集合字段与本组自有字段放在同一张表里，集合行只读
+  const attrTable = renderAttrDefTable(cat.attrs || [], state.dictionaries, linkedSet?.attrs || []);
   s3.appendChild(attrTable.root);
   formCol.appendChild(s3);
 
@@ -1003,8 +1144,58 @@ function buildManagePanel(cat) {
     const name = nameInput.value.trim();
     if (!name) { toastErr('名称必填'); return; }
 
+    const setId = pendingDetach ? '' : (setSelect.value || '');
+    const linking = !!setId && setId !== (cat.attrSetId || '');
+    const linkedOf = linking ? state.attrSets.find(s => s.id === setId) : null;
+    if (linking && !linkedOf) { toastErr('所选属性集合不存在'); return; }
+
+    // 关联集合 = 用集合字段替换本组原有字段，并清理原有字段已填的值
+    let removedKeys = [];
+    let valuesInCats = 0;
+    let matsAffected = 0;
+    if (linking) {
+      const setKeys = new Set((linkedOf.attrs || []).map(a => a.key));
+      removedKeys = (cat.attrs || []).map(a => a.key).filter(k => !setKeys.has(k));
+      const ids = Cat.selfAndDescendantIds(state.categories, cat.id);
+      for (const c of state.categories) {
+        if (!ids.has(c.id)) continue;
+        for (const k of removedKeys) if (k in (c.attrValues || {})) valuesInCats++;
+      }
+      if (cat.isLeaf) {
+        for (const m of state.materials) {
+          if (m.categoryId !== cat.id) continue;
+          if (removedKeys.some(k => k in (m.attrs || {}))) matsAffected++;
+        }
+      }
+
+      const ownCount = (cat.attrs || []).length;
+      const lines = [
+        `关联属性集合「${linkedOf.name}」会用集合字段替换本组现有字段。`,
+        removedKeys.length
+          ? `· 移除本组现有字段：${removedKeys.join('、')}`
+          : (ownCount ? '· 本组自有字段与集合字段 key 相同，改由集合字段接管' : '· 本组当前没有自有字段'),
+        valuesInCats ? `· 清理 ${valuesInCats} 处分组属性值（含下级分组）` : '',
+        matsAffected ? `· 清理 ${matsAffected} 条物料的属性值` : '',
+        removedKeys.length || valuesInCats || matsAffected ? '' : '· 没有已填的数据需要清理',
+        '清理只在浏览器草稿里完成，提交前仍可在「提交管理」丢弃；提交后不可恢复。确定继续？',
+      ].filter(Boolean);
+      const ok = await confirm(lines.join('\n'), '⚠ 会替换字段并清理现有数据');
+      if (!ok) { setSelect.value = cat.attrSetId || ''; return; }
+    }
+
     let attrs;
     try { attrs = attrTable.read(); } catch (e) { toastErr(e.message); return; }
+
+    // 脱离关联：把集合字段复制成本组自有字段（同名 key 本组覆盖）
+    if (pendingDetach) {
+      const merged = new Map();
+      for (const a of attrsOf(cat)) merged.set(a.key, a);
+      for (const a of attrs) merged.set(a.key, a);
+      attrs = Array.from(merged.values());
+    }
+    // 关联集合：原有自有字段被集合字段替换
+    if (linking) attrs = [];
+
     const keys = attrs.map(a => a.key);
     if (new Set(keys).size !== keys.length) { toastErr('属性 key 不能重复'); return; }
 
@@ -1037,11 +1228,18 @@ function buildManagePanel(cat) {
       attrs,
       attrValues,
     };
+    // 关联的属性集合（实时关联）；空值不写字段
+    if (setId) next.attrSetId = setId;
+    else delete next.attrSetId;
     delete next.code;
     const d = draftOf('category', cat.id);
     await saveCategoryDraft(next, d?.op === 'add' ? 'add' : 'update');
+
+    // 关联后清理被移除字段在下级分组 / 物料上的残留值
+    if (linking && removedKeys.length) await cleanFieldValues(cat, removedKeys);
+
     render();
-    toastOk('已保存为草稿');
+    toastOk(linking ? '已关联集合并清理旧字段数据（草稿）' : '已保存为草稿');
   };
 
   // 右侧图标工具栏：保存 / 删除（样式同物料档案侧栏）
@@ -1053,6 +1251,9 @@ function buildManagePanel(cat) {
   const delBtn = mk('button', { class: 'rail-btn danger-hover', title: '删除分组' }, '✕');
   delBtn.addEventListener('click', () => doDeleteCategory(cat));
   rail.appendChild(delBtn);
+  const copyBtn = mk('button', { class: 'rail-btn', title: '复制分组' }, '⧉');
+  copyBtn.addEventListener('click', () => doCopyCategory(cat));
+  rail.appendChild(copyBtn);
 
   body.appendChild(formCol);
   body.appendChild(rail);
@@ -1076,6 +1277,159 @@ async function doDeleteCategory(cat) {
   }
   render();
   toastOk('已标记为删除');
+}
+
+// 复制分组：可连同子分组一起复制，可选是否带上物料（全部走草稿）
+async function doCopyCategory(cat) {
+  const ids = Cat.selfAndDescendantIds(state.categories, cat.id);
+  const subCount = ids.size - 1;
+  const matsInTree = state.materials.filter(m => m.categoryId && ids.has(m.categoryId));
+
+  // 目标父级：根级 + 所有非末级分组（排除自身及后代，避免把树拷进自己里面）
+  const parentOptions = [{ id: null, label: '（根级）' }];
+  for (const c of state.categories) {
+    if (ids.has(c.id) || c.isLeaf) continue;
+    parentOptions.push({ id: c.id, label: Cat.categoryPathString(state.categories, c.id) });
+  }
+
+  const body = mk('div', { class: 'copy-form' });
+
+  body.appendChild(mk('label', {}, '新分组名称'));
+  const nameInput = mk('input', { type: 'text', value: `${cat.name} 副本` });
+  body.appendChild(nameInput);
+
+  body.appendChild(mk('label', {}, '复制到'));
+  const parentSel = mk('select');
+  for (const p of parentOptions) {
+    const o = mk('option', { value: p.id || '' }, p.label);
+    if ((cat.parentId || '') === (p.id || '')) o.selected = true;
+    parentSel.appendChild(o);
+  }
+  body.appendChild(parentSel);
+
+  body.appendChild(mk('label', {}, '复制内容'));
+  const onlyChk = mk('input', { type: 'radio', name: 'copyMode', value: 'group', checked: true });
+  const allChk = mk('input', { type: 'radio', name: 'copyMode', value: 'all' });
+  const modeBox = mk('div', { class: 'copy-modes' });
+  const mkMode = (input, text) => {
+    const lbl = mk('label', { class: 'copy-mode' });
+    lbl.appendChild(input);
+    lbl.appendChild(mk('span', {}, text));
+    return lbl;
+  };
+  modeBox.appendChild(mkMode(onlyChk, `仅分组数据（${subCount} 个子分组，不含物料）`));
+  modeBox.appendChild(mkMode(allChk, `分组数据 + 物料档案（${subCount} 个子分组，${matsInTree.length} 条物料）`));
+  if (!matsInTree.length) allChk.disabled = true;
+  body.appendChild(modeBox);
+  body.appendChild(mk('div', { class: 'hint' },
+    '分组数据包含：名称、描述、排序、末级标记、属性字段与已填的整组属性值；物料会生成新的物料编码。'));
+
+  openModal({
+    title: `复制分组「${cat.name}」`,
+    body,
+    actions: [
+      { label: '取消', onClick: closeModal },
+      {
+        label: '复制', className: 'primary',
+        onClick: async () => {
+          const name = nameInput.value.trim();
+          if (!name) { toastErr('新分组名称必填'); return; }
+          const targetParent = parentSel.value || null;
+          if (state.categories.some(c => (c.parentId || null) === targetParent && c.name === name)) {
+            toastErr('该层级下已有同名分组'); return;
+          }
+
+          // 1) 分组：先建新旧 id 映射，再按映射重建父子关系
+          const idMap = new Map();
+          for (const c of state.categories) if (ids.has(c.id)) idMap.set(c.id, mint('category'));
+          const siblingCount = state.categories.filter(c => (c.parentId || null) === targetParent).length;
+
+          const newCats = state.categories
+            .filter(c => ids.has(c.id))
+            .map(c => {
+              const isRoot = c.id === cat.id;
+              return {
+                ...clone(c),
+                id: idMap.get(c.id),
+                name: isRoot ? name : c.name,
+                parentId: isRoot ? targetParent : idMap.get(c.parentId || null),
+                sort: isRoot ? siblingCount : c.sort,
+                attrs: clone(c.attrs || []),
+                attrValues: clone(c.attrValues || {}),
+              };
+            });
+          for (const nc of newCats) await saveCategoryDraft(nc, 'add');
+
+          // 2) 物料：新编码（当天流水号顺延），挂到复制出来的分组上
+          let newMatCount = 0;
+          if (allChk.checked && matsInTree.length) {
+            const d = new Date();
+            const prefix = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+            const used = new Set();
+            for (const m of state.materials) {
+              const code = String(m.code || '');
+              if (!code.startsWith(prefix)) continue;
+              const seq = Number(code.slice(prefix.length));
+              if (Number.isInteger(seq) && seq > 0) used.add(seq);
+            }
+            let seq = 1;
+            for (const m of matsInTree) {
+              while (used.has(seq)) seq++;
+              const code = prefix + String(seq).padStart(4, '0');
+              used.add(seq);
+              await saveMaterialDraft({
+                ...clone(m),
+                id: mint('m'),
+                categoryId: idMap.get(m.categoryId),
+                code,
+                attrs: clone(m.attrs || {}),
+                location: 'local',
+                syncedAt: '',
+                createdAt: nowISO(),
+                updatedAt: nowISO(),
+                createdBy: '',
+                updatedBy: '',
+              }, 'add');
+              newMatCount++;
+            }
+          }
+
+          await loadDrafts();
+          closeModal();
+          state.selectedCategoryId = idMap.get(cat.id);
+          render();
+          toastOk(`已复制为「${name}」（${newCats.length} 个分组${newMatCount ? `、${newMatCount} 条物料` : ''}，草稿）`);
+        },
+      },
+    ],
+  });
+}
+
+
+// 关联属性集合后，清理被移除字段在下级分组 / 本组物料上的残留值（全部走草稿）
+async function cleanFieldValues(cat, removedKeys) {
+  if (!removedKeys.length) return;
+  const ids = Cat.selfAndDescendantIds(state.categories, cat.id);
+  for (const c of state.categories) {
+    if (!ids.has(c.id)) continue;
+    const hit = removedKeys.filter(k => k in (c.attrValues || {}));
+    if (!hit.length) continue;
+    const next = { ...c, attrValues: { ...c.attrValues } };
+    for (const k of hit) delete next.attrValues[k];
+    const d = draftOf('category', c.id);
+    await saveCategoryDraft(next, d?.op === 'add' ? 'add' : 'update');
+  }
+  // 只有末级分组的字段值存在物料上
+  if (!cat.isLeaf) return;
+  for (const m of state.materials) {
+    if (m.categoryId !== cat.id) continue;
+    const hit = removedKeys.filter(k => k in (m.attrs || {}));
+    if (!hit.length) continue;
+    const next = { ...m, attrs: { ...m.attrs }, updatedAt: nowISO() };
+    for (const k of hit) delete next.attrs[k];
+    const d = draftOf('material', m.id);
+    await saveMaterialDraft(next, d?.op === 'add' ? 'add' : 'update');
+  }
 }
 
 function sectionTitle(idx, text, sub) {
@@ -1149,40 +1503,219 @@ function openCategoryDialog(parentId) {
   });
 }
 
-// ---------- 设置 ----------
+// ---------- 系统设置：字典设置 + 属性集合 ----------
 function renderSettings() {
   const content = document.getElementById('content');
   content.className = 'content scroll';
   content.innerHTML = '';
 
-  const form = mk('div', { class: 'settings-form' });
-  form.appendChild(mk('h2', { style: 'margin:0 0 4px;font-size:15px;' }, '仓库设置'));
-  form.appendChild(mk('div', { class: 'hint' }, '修好后点保存，然后去「提交管理」填 PAT 提交。'));
+  const tabs = mk('div', { class: 'subtabs' });
+  const tabDefs = [
+    { key: 'dict', label: `字典设置（${state.dictionaries.length}）` },
+    { key: 'set', label: `属性集合（${state.attrSets.length}）` },
+  ];
+  if (!state.settingTab) state.settingTab = 'dict';
+  for (const t of tabDefs) {
+    const b = mk('button', { class: `subtab ${state.settingTab === t.key ? 'active' : ''}` }, t.label);
+    b.addEventListener('click', () => { state.settingTab = t.key; render(); });
+    tabs.appendChild(b);
+  }
+  content.appendChild(tabs);
 
-  const ownerInput = mk('input', { type: 'text', value: state.settings.owner });
-  const repoInput = mk('input', { type: 'text', value: state.settings.repo });
-  const branchInput = mk('input', { type: 'text', value: state.settings.branch });
+  if (state.settingTab === 'dict') content.appendChild(buildDictionarySection());
+  else content.appendChild(buildAttrSetSection());
+}
 
-  form.appendChild(settingRow('Owner', ownerInput));
-  form.appendChild(settingRow('Repo', repoInput));
-  form.appendChild(settingRow('Branch', branchInput));
+// ----- 字典设置 -----
+function buildDictionarySection() {
+  const wrap = mk('div', { class: 'setting-block' });
+  wrap.appendChild(mk('div', { class: 'hint' },
+    '字典是给「下拉单选 / 单选 / 多选」类型属性提供选项的选项库，改一次所有引用它的字段一起生效。'));
 
-  const saveBtn = mk('button', { class: 'btn primary' }, '保存');
-  saveBtn.addEventListener('click', async () => {
-    const owner = ownerInput.value.trim();
-    const repo = repoInput.value.trim();
-    const branch = branchInput.value.trim();
-    if (!owner || !repo || !branch) { toastErr('请填写完整'); return; }
-    GH.saveGithubSettings({ owner, repo, branch });
-    state.settings = GH.getGithubSettings();
-    toastOk('已保存，正在重新同步…');
-    await refreshRemote();
-    await loadDrafts();
+  if (!state.dictionaries.length) {
+    wrap.appendChild(mk('div', { class: 'empty', style: 'padding:20px;' }, '还没有字典'));
+  }
+
+  for (const dict of state.dictionaries) {
+    const card = mk('div', { class: 'dict-card' });
+    const head = mk('div', { class: 'dict-head' });
+    const nameInput = mk('input', { type: 'text', value: dict.name, class: 'dict-name' });
+    head.appendChild(nameInput);
+    head.appendChild(mk('span', { class: 'muted' }, `${dict.items.length} 项`));
+
+    const usedBy = [
+      ...state.categories.flatMap(c => (c.attrs || []).map(a => ({ a, c }))),
+      ...state.attrSets.flatMap(s => (s.attrs || []).map(a => ({ a, c: { name: '集合：' + s.name } }))),
+    ].filter(x => x.a.dictId === dict.id);
+    if (usedBy.length) {
+      head.appendChild(mk('span', { class: 'from-tag' }, `被 ${usedBy.length} 个字段引用`));
+    }
+
+    const delBtn = mk('button', { class: 'btn danger small' }, '删除字典');
+    delBtn.addEventListener('click', () => doDeleteDictionary(dict, usedBy));
+    head.appendChild(delBtn);
+    card.appendChild(head);
+
+    // 字典项
+    const itemWrap = mk('div', { class: 'dict-items' });
+    const rows = [];
+    const addItemRow = (item) => {
+      const row = mk('div', { class: 'dict-item-row' });
+      const labelInput = mk('input', { type: 'text', value: item?.label || '', placeholder: '显示名，如 35平方' });
+      const valueInput = mk('input', { type: 'text', value: item?.value || '', placeholder: '存储值，如 35' });
+      const rm = mk('button', { class: 'btn danger small', type: 'button' }, '删');
+      row.appendChild(labelInput);
+      row.appendChild(valueInput);
+      rm.addEventListener('click', () => { row.remove(); });
+      row.appendChild(rm);
+      itemWrap.appendChild(row);
+      rows.push({ row, labelInput, valueInput });
+    };
+    for (const it of dict.items) addItemRow(it);
+    const head2 = mk('div', { class: 'dict-item-row dict-item-head' });
+    head2.appendChild(mk('span', { class: 'muted' }, '显示名'));
+    head2.appendChild(mk('span', { class: 'muted' }, '存储值'));
+    head2.appendChild(mk('span', {}));
+    itemWrap.insertBefore(head2, itemWrap.firstChild);
+    card.appendChild(itemWrap);
+
+    const actions = mk('div', { class: 'dict-actions' });
+    const addBtn = mk('button', { class: 'btn small', type: 'button' }, '＋ 添加选项');
+    addBtn.addEventListener('click', () => addItemRow({ label: '', value: '' }));
+    actions.appendChild(addBtn);
+
+    const saveBtn = mk('button', { class: 'btn primary small' }, '保存字典');
+    saveBtn.addEventListener('click', async () => {
+      const name = nameInput.value.trim();
+      if (!name) { toastErr('字典名称必填'); return; }
+      if (state.dictionaries.some(d => d.id !== dict.id && d.name === name)) {
+        toastErr('字典名称已存在'); return;
+      }
+      const items = [];
+      for (const r of rows) {
+        if (!r.row.isConnected) continue;
+        const label = r.labelInput.value.trim();
+        const value = r.valueInput.value.trim();
+        if (!label && !value) continue;
+        if (!value) { toastErr('存储值不能为空'); return; }
+        if (items.some(i => i.value === value)) { toastErr(`存储值「${value}」重复`); return; }
+        items.push({ value, label: label || value });
+      }
+      const d = draftOf('dictionary', dict.id);
+      await saveDictionaryDraft({ ...dict, name, items }, d?.op === 'add' ? 'add' : 'update');
+      render();
+      toastOk('字典已保存为草稿');
+    });
+    actions.appendChild(saveBtn);
+    card.appendChild(actions);
+
+    wrap.appendChild(card);
+  }
+
+  const newBtn = mk('button', { class: 'btn' }, '＋ 新建字典');
+  newBtn.addEventListener('click', async () => {
+    let i = state.dictionaries.length + 1;
+    while (state.dictionaries.some(d => d.name === `新字典${i}`)) i++;
+    await saveDictionaryDraft({ id: mint('dict'), name: `新字典${i}`, items: [] }, 'add');
     render();
+    toast('已创建，改好名称和选项后点「保存字典」');
   });
-  form.appendChild(saveBtn);
+  wrap.appendChild(newBtn);
+  return wrap;
+}
 
-  content.appendChild(form);
+async function doDeleteDictionary(dict, usedBy) {
+  if (usedBy.length) {
+    const where = usedBy.slice(0, 5).map(x => `「${x.c.name}」的「${x.a.label}」`).join('、');
+    toastErr(`该字典正被 ${usedBy.length} 个字段引用（${where}${usedBy.length > 5 ? ' 等' : ''}），请先改成其它字典`);
+    return;
+  }
+  if (!(await confirm(`确定删除字典「${dict.name}」？`))) return;
+  const d = draftOf('dictionary', dict.id);
+  if (d?.op === 'add') {
+    await Store.removeDraft('dictionary', dict.id);
+    await loadDrafts();
+  } else {
+    await saveDictionaryDraft({ ...dict }, 'delete');
+  }
+  render();
+  toastOk('已标记为删除');
+}
+
+// ----- 属性集合 -----
+function buildAttrSetSection() {
+  const wrap = mk('div', { class: 'setting-block' });
+  wrap.appendChild(mk('div', { class: 'hint' },
+    '属性集合是一整套属性模板：在分组管理里「关联」后，该分组的物料属性 / 给下级分组的属性由集合实时提供，改集合一次全部生效。'));
+
+  if (!state.attrSets.length) {
+    wrap.appendChild(mk('div', { class: 'empty', style: 'padding:20px;' }, '还没有属性集合'));
+  }
+
+  for (const set of state.attrSets) {
+    const card = mk('div', { class: 'dict-card' });
+    const head = mk('div', { class: 'dict-head' });
+    const nameInput = mk('input', { type: 'text', value: set.name, class: 'dict-name' });
+    head.appendChild(nameInput);
+    const usedBy = state.categories.filter(c => c.attrSetId === set.id);
+    head.appendChild(mk('span', { class: 'muted' },
+      `${set.attrs.length} 个属性 · ${usedBy.length} 个分组在用`));
+    const delBtn = mk('button', { class: 'btn danger small' }, '删除集合');
+    delBtn.addEventListener('click', () => doDeleteAttrSet(set, usedBy));
+    head.appendChild(delBtn);
+    card.appendChild(head);
+
+    const editor = renderAttrDefTable(set.attrs || [], state.dictionaries);
+    card.appendChild(editor.root);
+
+    const actions = mk('div', { class: 'dict-actions' });
+    const saveBtn = mk('button', { class: 'btn primary small' }, '保存集合');
+    saveBtn.addEventListener('click', async () => {
+      const name = nameInput.value.trim();
+      if (!name) { toastErr('集合名称必填'); return; }
+      if (state.attrSets.some(s => s.id !== set.id && s.name === name)) { toastErr('集合名称已存在'); return; }
+      let attrs;
+      try { attrs = editor.read(); } catch (e) { toastErr(e.message); return; }
+      const keys = attrs.map(a => a.key);
+      if (new Set(keys).size !== keys.length) { toastErr('属性 key 不能重复'); return; }
+      const d = draftOf('attrSet', set.id);
+      await saveAttrSetDraft({ ...set, name, attrs }, d?.op === 'add' ? 'add' : 'update');
+      render();
+      toastOk('属性集合已保存为草稿');
+    });
+    actions.appendChild(saveBtn);
+    card.appendChild(actions);
+
+    wrap.appendChild(card);
+  }
+
+  const newBtn = mk('button', { class: 'btn' }, '＋ 新建属性集合');
+  newBtn.addEventListener('click', async () => {
+    let i = state.attrSets.length + 1;
+    while (state.attrSets.some(s => s.name === `新集合${i}`)) i++;
+    await saveAttrSetDraft({ id: mint('set'), name: `新集合${i}`, attrs: [] }, 'add');
+    render();
+    toast('已创建，改好名称和属性后点「保存集合」');
+  });
+  wrap.appendChild(newBtn);
+  return wrap;
+}
+
+async function doDeleteAttrSet(set, usedBy) {
+  if (usedBy.length) {
+    toastErr(`该集合正被 ${usedBy.length} 个分组关联（${usedBy.slice(0, 3).map(c => '「' + c.name + '」').join('、')}${usedBy.length > 3 ? ' 等' : ''}），请先在这些分组里取消关联或脱离关联`);
+    return;
+  }
+  if (!(await confirm(`确定删除属性集合「${set.name}」？`))) return;
+  const d = draftOf('attrSet', set.id);
+  if (d?.op === 'add') {
+    await Store.removeDraft('attrSet', set.id);
+    await loadDrafts();
+  } else {
+    await saveAttrSetDraft({ ...set }, 'delete');
+  }
+  render();
+  toastOk('已标记为删除');
 }
 
 function settingRow(label, input, hint) {
@@ -1221,6 +1754,31 @@ function renderCommit() {
   patSection.appendChild(mk('div', { class: 'hint', style: 'margin-top:6px;font-size:12px;color:var(--text-muted);' },
     'Fine-grained PAT，仅授予本仓库 Contents: Read and write。Token 只存在内存，刷新即清除。'));
   content.appendChild(patSection);
+
+  // 仓库设置（原「设置」页并入这里：提交目标仓库）
+  const repoSection = mk('div', { class: 'section' });
+  repoSection.appendChild(mk('div', { class: 'section-title' }, '仓库设置'));
+  const ownerInput = mk('input', { type: 'text', value: state.settings.owner });
+  const repoInput = mk('input', { type: 'text', value: state.settings.repo });
+  const branchInput = mk('input', { type: 'text', value: state.settings.branch });
+  repoSection.appendChild(settingRow('Owner', ownerInput));
+  repoSection.appendChild(settingRow('Repo', repoInput));
+  repoSection.appendChild(settingRow('Branch', branchInput));
+  const repoSave = mk('button', { class: 'btn' }, '保存仓库设置');
+  repoSave.addEventListener('click', async () => {
+    const owner = ownerInput.value.trim();
+    const repo = repoInput.value.trim();
+    const branch = branchInput.value.trim();
+    if (!owner || !repo || !branch) { toastErr('请填写完整'); return; }
+    GH.saveGithubSettings({ owner, repo, branch });
+    state.settings = GH.getGithubSettings();
+    toastOk('已保存，正在重新同步…');
+    await refreshRemote();
+    await loadDrafts();
+    render();
+  });
+  repoSection.appendChild(repoSave);
+  content.appendChild(repoSection);
 
   // 改动列表
   const listSection = mk('div', { class: 'section' });
@@ -1280,11 +1838,16 @@ function renderCommit() {
 }
 
 function draftLabel(d) {
+  const opText = { add: '新增', update: '修改', delete: '删除' }[d.op] || d.op;
   if (d.kind === 'category') {
-    const opText = { add: '新增', update: '修改', delete: '删除' }[d.op] || d.op;
     return `【分组】${opText} ${d.data?.name || d.recordId}`;
   }
-  const opText = { add: '新增', update: '修改', delete: '删除' }[d.op] || d.op;
+  if (d.kind === 'dictionary') {
+    return `【字典】${opText} ${d.data?.name || d.recordId}（${d.data?.items?.length || 0} 项）`;
+  }
+  if (d.kind === 'attrSet') {
+    return `【属性集合】${opText} ${d.data?.name || d.recordId}（${d.data?.attrs?.length || 0} 个属性）`;
+  }
   const catName = d.data?.categoryId ? Cat.categoryPathString(state.categories, d.data.categoryId) : '';
   return `【物料】${opText} ${d.data?.code || d.recordId}${d.data?.name ? ' ' + d.data.name : ''}${catName ? '（' + catName + '）' : ''}`;
 }
@@ -1301,35 +1864,32 @@ async function discardAllDrafts() {
 // ---------- 提交 ----------
 function buildCommitPayload(selectedDrafts) {
   const now = nowISO();
-  let cats = clone(state.baseCategories);
-  let mats = clone(state.baseMaterials);
+  const sets = {};
+  for (const s of DATA_SETS) sets[s.kind] = clone(state[s.base]);
 
   for (const d of selectedDrafts) {
-    if (d.kind === 'category') {
-      const idx = cats.findIndex(c => c.id === d.recordId);
-      if (d.op === 'delete') { if (idx >= 0) cats.splice(idx, 1); }
-      else if (idx >= 0) cats[idx] = clone(d.data);
-      else cats.push(clone(d.data));
-    } else {
-      const idx = mats.findIndex(m => m.id === d.recordId);
-      if (d.op === 'delete') { if (idx >= 0) mats.splice(idx, 1); }
-      else {
-        const next = clone(d.data);
-        next.location = 'cloud';
-        next.syncedAt = now;
-        if (idx >= 0) mats[idx] = next; else mats.push(next);
-      }
+    const target = sets[d.kind];
+    if (!target) continue;
+    const idx = target.findIndex(x => x.id === d.recordId);
+    if (d.op === 'delete') {
+      if (idx >= 0) target.splice(idx, 1);
+      continue;
     }
+    const next = clone(d.data);
+    if (d.kind === 'material') {
+      next.location = 'cloud';
+      next.syncedAt = now;
+    }
+    if (idx >= 0) target[idx] = next; else target.push(next);
   }
 
-  const catsText = JSON.stringify(cats, null, 2) + '\n';
-  const matsText = JSON.stringify(mats, null, 2) + '\n';
-
   const textChanges = [];
-  if (catsText !== state.rawCategoriesText) textChanges.push({ path: CONFIG.categoriesPath, content: catsText });
-  if (matsText !== state.rawMaterialsText) textChanges.push({ path: CONFIG.materialsPath, content: matsText });
+  for (const s of DATA_SETS) {
+    const text = JSON.stringify(sets[s.kind], null, 2) + '\n';
+    if (text !== state[s.raw]) textChanges.push({ path: s.path, content: text });
+  }
 
-  return { textChanges, cats, mats };
+  return { textChanges };
 }
 
 async function doCommit(selectedIds, message, btn) {

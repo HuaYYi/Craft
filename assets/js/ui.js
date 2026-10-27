@@ -91,7 +91,7 @@ export async function confirm(message, title = '确认') {
   return new Promise((resolve) => {
     openModal({
       title,
-      body: mk('p', {}, message),
+      body: mk('p', { style: 'white-space: pre-line;' }, message),
       actions: [
         { label: '取消', onClick: () => { closeModal(); resolve(false); } },
         { label: '确定', className: 'primary', onClick: () => { closeModal(); resolve(true); } },

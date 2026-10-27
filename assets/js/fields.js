@@ -192,7 +192,7 @@ export function validateField(field, val) {
 // ---------- 字段定义编辑器（表与字段管理页用） ----------
 
 // 渲染一行字段定义（可编辑）
-export function renderFieldEditor(field, index) {
+export function renderFieldEditor(field, index, dictionaries = [], readonly = false) {
   const tr = document.createElement('tr');
   tr.dataset.index = index;
 
@@ -205,74 +205,173 @@ export function renderFieldEditor(field, index) {
     typeSelect.appendChild(o);
   }
 
-  const optionsInput = mk('input', {
-    type: 'text',
-    placeholder: '选项用英文逗号分隔',
-    value: Array.isArray(field.options) ? field.options.join(',') : '',
-  });
+  // 选项来源：字典（单选/多选/下拉单选从字典取选项，可复用）
+  const dictSelect = mk('select');
+  dictSelect.appendChild(mk('option', { value: '' }, '（请选择字典）'));
+  for (const d of dictionaries) {
+    const o = mk('option', { value: d.id }, `${d.name}（${d.items?.length || 0} 项）`);
+    if (field.dictId === d.id) o.selected = true;
+    dictSelect.appendChild(o);
+  }
+  if (field.dictId && !dictionaries.some(d => d.id === field.dictId)) {
+    const o = mk('option', { value: field.dictId }, '（字典已删除）');
+    o.selected = true;
+    dictSelect.appendChild(o);
+  }
 
-  const delBtn = mk('button', { class: 'btn danger small', type: 'button' }, '删');
+  const delBtn = readonly
+    ? mk('span', { class: 'from-tag' }, '来自集合')
+    : mk('button', { class: 'btn danger small', type: 'button' }, '删');
 
+  // 拖动手柄：只有本组自有字段能拖动排序（来自集合的行顺序由集合决定）
+  const dragTd = document.createElement('td');
+  dragTd.className = 'col-drag';
+  if (!readonly) {
+    dragTd.appendChild(mk('span', { class: 'drag-handle', title: '按住拖动调整顺序', draggable: 'true' }, '⠿'));
+  }
+  tr.appendChild(dragTd);
   tr.appendChild(td(keyInput));
   tr.appendChild(td(labelInput));
   tr.appendChild(td(typeSelect));
-  tr.appendChild(td(optionsInput));
-  tr.appendChild(td(mkLabeledCheckbox('必填', !!field.required)));
-  tr.appendChild(td(mkLabeledCheckbox('唯一', !!field.unique)));
+  tr.appendChild(td(dictSelect));
+  tr.appendChild(td(mkRoleCheckbox('required', !!field.required)));
+  tr.appendChild(td(mkRoleCheckbox('unique', !!field.unique)));
   tr.appendChild(td(delBtn));
 
-  // 显隐 options 输入框
+  // 只有需要选项的类型才启用字典选择
   const refresh = () => {
-    const t = typeSelect.value;
-    optionsInput.disabled = !FIELD_TYPES[t].needsOptions;
-    optionsInput.placeholder = FIELD_TYPES[t].needsOptions ? '选项用英文逗号分隔' : '(无需选项)';
+    const need = FIELD_TYPES[typeSelect.value].needsOptions;
+    dictSelect.disabled = readonly || !need;
+    dictSelect.title = readonly
+      ? '来自属性集合，只读；要改请到「系统设置 → 属性集合」'
+      : (need ? '选项来自字典，可在「系统设置 → 字典设置」里维护' : '该类型不需要选项');
   };
   typeSelect.addEventListener('change', refresh);
   refresh();
 
-  tr._read = () => ({
-    key: keyInput.value.trim(),
-    label: labelInput.value.trim() || keyInput.value.trim() || '字段',
-    type: typeSelect.value,
-    required: tr.querySelector('input[data-role="required"]').checked,
-    unique: tr.querySelector('input[data-role="unique"]').checked,
-    default: field.default,
-    options: optionsInput.disabled ? undefined :
-             optionsInput.value.split(',').map(s => s.trim()).filter(Boolean),
-  });
+  if (readonly) {
+    for (const el of tr.querySelectorAll('input, select')) el.disabled = true;
+    tr.classList.add('row-readonly');
+  }
+
+  tr._read = () => {
+    if (readonly) return null;
+    const type = typeSelect.value;
+    const next = {
+      key: keyInput.value.trim(),
+      label: labelInput.value.trim() || keyInput.value.trim() || '字段',
+      type,
+      required: tr.querySelector('input[data-role="required"]').checked,
+      unique: tr.querySelector('input[data-role="unique"]').checked,
+      default: field.default,
+      dictId: dictSelect.value || undefined,
+    };
+    // 历史字段若还带着逗号选项、又没有字典，保留原选项避免丢数据
+    if (!next.dictId && Array.isArray(field.options)?.length) next.options = field.options;
+    return next;
+  };
 
   return tr;
 }
 
 function td(child) { const e = document.createElement('td'); e.appendChild(child); return e; }
-function mkLabeledCheckbox(label, checked) {
-  const wrap = mk('label', { class: 'chk-inline' });
+// 表头已写明「必填 / 唯一」，单元格里只放勾选框，不再重复文字
+function mkRoleCheckbox(role, checked) {
   const cb = mk('input', { type: 'checkbox' });
   if (checked) cb.checked = true;
-  cb.dataset.role = label === '必填' ? 'required' : 'unique';
-  wrap.appendChild(cb);
-  wrap.appendChild(document.createTextNode(' ' + label));
-  return wrap;
+  cb.dataset.role = role;
+  return cb;
 }
 
-// ---------- 属性定义表（分组物料属性 / 给子分组加字段）----------
+// 表格行拖动排序：只能拖本组自有字段（来自集合的只读行固定在顶部，拖到只读区就排到第一个可编辑行前）
+// 顺序即 DOM 顺序，read() 按 DOM 顺序返回，保存后顺序持久化
+export function enableRowDrag(tbody) {
+  let dragging = null;
+
+  const clearMarks = () => {
+    for (const tr of Array.from(tbody.children)) tr.classList.remove('drop-above', 'drop-below');
+  };
+  const endDrag = () => {
+    if (dragging) dragging.classList.remove('row-dragging');
+    dragging = null;
+    clearMarks();
+  };
+
+  tbody.addEventListener('dragstart', (e) => {
+    if (!e.target.closest || !e.target.closest('.drag-handle')) return;
+    const tr = e.target.closest('tr');
+    if (!tr || tr.classList.contains('row-readonly')) return;
+    dragging = tr;
+    tr.classList.add('row-dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    try {
+      e.dataTransfer.setData('text/plain', '');
+      e.dataTransfer.setDragImage(tr, 12, 12);
+    } catch (_) { /* 部分浏览器不支持自定义拖影 */ }
+  });
+
+  tbody.addEventListener('dragover', (e) => {
+    if (!dragging) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    clearMarks();
+    const tr = e.target.closest && e.target.closest('tr');
+    if (!tr || tr === dragging) return;
+    const rect = tr.getBoundingClientRect();
+    tr.classList.add(e.clientY > rect.top + rect.height / 2 ? 'drop-below' : 'drop-above');
+  });
+
+  tbody.addEventListener('drop', (e) => {
+    if (!dragging) return;
+    e.preventDefault();
+    const tr = e.target.closest && e.target.closest('tr');
+    clearMarks();
+    if (!tr || tr === dragging) { endDrag(); return; }
+
+    if (tr.classList.contains('row-readonly')) {
+      // 只读行永远在上方，落到只读区就排到第一个可编辑行之前
+      const first = tbody.querySelector('tr:not(.row-readonly)');
+      if (first && first !== dragging) tbody.insertBefore(dragging, first);
+    } else {
+      const rect = tr.getBoundingClientRect();
+      const after = e.clientY > rect.top + rect.height / 2;
+      const ref = after ? tr.nextElementSibling : tr;
+      if (ref !== dragging) tbody.insertBefore(dragging, ref);
+    }
+    endDrag();
+  });
+
+  tbody.addEventListener('dragend', endDrag);
+}
+
+
 /**
- * @param {Array} attrs  属性定义数组 [{key,label,type,options,required}]
+ * @param {Array} attrs  本组自有属性定义 [{key,label,type,dictId,required,unique}]
+ * @param {Array} dictionaries 字典数组 [{id,name,items:[{value,label}]}]
+ * @param {Array} linkedAttrs  关联属性集合的字段，只读展示在本组字段上方
  * @returns {{ root: HTMLElement, read: () => Array }}
  */
-export function renderAttrDefTable(attrs = []) {
+export function renderAttrDefTable(attrs = [], dictionaries = [], linkedAttrs = []) {
   const wrap = mk('div');
   const table = mk('table', { class: 'field-editor-table' });
   const head = mk('tr');
-  ['属性key', '显示名', '类型', '选项(逗号)', '必填', '唯一', ''].forEach(t => head.appendChild(mk('th', {}, t)));
+  ['', '属性key', '显示名', '类型', '字典', '必填', '唯一', ''].forEach((t, i) => {
+    const th = mk('th', {}, t);
+    if (i === 0) th.className = 'col-drag';
+    head.appendChild(th);
+  });
   table.appendChild(head);
 
   const tbody = mk('tbody');
-  const addRow = (attr) => {
-    const tr = renderFieldEditor(attr || { type: 'text' }, tbody.children.length);
-    tr.querySelector('button.danger.small').addEventListener('click', () => tr.remove());
+  enableRowDrag(tbody);
+  const addRow = (attr, readonly = false) => {
+    const tr = renderFieldEditor(attr || { type: 'text' }, tbody.children.length, dictionaries, readonly);
+    if (!readonly) {
+      tr.querySelector('button.danger.small').addEventListener('click', () => tr.remove());
+    }
     tbody.appendChild(tr);
   };
+  for (const a of linkedAttrs) addRow(a, true);
   for (const a of attrs) addRow(a);
   table.appendChild(tbody);
   wrap.appendChild(table);
@@ -286,9 +385,13 @@ export function renderAttrDefTable(attrs = []) {
     read() {
       const out = [];
       for (const tr of Array.from(tbody.children)) {
-        const r = tr._read();
+        const r = tr._read?.();
+        if (!r) continue;               // 只读行（来自属性集合）不写入本组字段
         if (!r.key && !r.label) continue;
         if (!r.key) throw new Error('属性 key 不能为空');
+        if (FIELD_TYPES[r.type].needsOptions && !r.dictId) {
+          throw new Error(`属性「${r.label}」是${FIELD_TYPES[r.type].label}，需要先选一个字典`);
+        }
         out.push(r);
       }
       return out;

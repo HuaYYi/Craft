@@ -8,6 +8,8 @@ export const CONFIG = {
   // 仓库内数据文件路径
   categoriesPath: 'data/categories.json',
   materialsPath: 'data/materials.json',
+  dictionariesPath: 'data/dictionaries.json',
+  attrSetsPath: 'data/attrSets.json',
 
   // 附件限制
   attachmentMaxSizeMB: 25,
