@@ -47,11 +47,16 @@ const state = {
   expanded: new Set(),
   checked: new Set(),
   search: '',
+  dictChecked: new Set(),     // 字典设置页勾选
+  setChecked: new Set(),      // 属性集合页勾选
   draggingCatId: null,        // 正在拖拽的分组 id
 };
 
 const mint = (prefix) => `${prefix}_${crypto.randomUUID().slice(0, 8)}`;
 const nowISO = () => new Date().toISOString();
+
+// 当前视图要挂到页面右栏的图标工具栏（由各面板构建时塞进来，页面统一放到右栏）
+let pendingRail = null;
 
 // 物料编码自动生成：年月日 + 四位流水号（如 202610270001）
 // 当天已用过的序号往后顺延；草稿里的新物料也算在内，避免重复
@@ -113,14 +118,37 @@ async function init() {
 
 function bindNav() {
   document.querySelectorAll('.nav-item').forEach(item => {
-    item.addEventListener('click', () => switchView(item.dataset.view));
+    if (!item.dataset.view) return;
+    item.addEventListener('click', () => {
+      // 父项：已在系统设置里则只做展开/收起；从别的视图进来先展开再切换
+      if (item.classList.contains('nav-parent')) {
+        if (state.view === 'settings') { toggleNavGroup(!state.navOpen); return; }
+        toggleNavGroup(true);
+      }
+      switchView(item.dataset.view, item.dataset.sub);
+    });
   });
   document.getElementById('commitLink').addEventListener('click', () => switchView('commit'));
+  const saved = localStorage.getItem('craft.navOpen');
+  toggleNavGroup(saved === '1');
 }
 
-function switchView(view) {
+// 二级导航展开/收起（状态持久化到 localStorage）
+function toggleNavGroup(open) {
+  state.navOpen = !!open;
+  document.querySelector('.nav').classList.toggle('nav-open', state.navOpen);
+  localStorage.setItem('craft.navOpen', state.navOpen ? '1' : '0');
+}
+
+function switchView(view, sub) {
   state.view = view;
-  document.querySelectorAll('.nav-item').forEach(i => i.classList.toggle('active', i.dataset.view === view));
+  if (view === 'settings' && sub) state.settingTab = sub;
+  const curSub = view === 'settings' ? (state.settingTab || 'dict') : null;
+  document.querySelectorAll('.nav-item').forEach(i => {
+    const isSub = !!i.dataset.sub;
+    const active = i.dataset.view === view && (!isSub || i.dataset.sub === curSub);
+    i.classList.toggle('active', active);
+  });
   document.getElementById('commitLink').classList.toggle('active', view === 'commit');
   const titles = { materials: '物料及分组', settings: '系统设置', commit: '提交管理' };
   document.getElementById('topbarTitle').textContent = titles[view] || '';
@@ -270,8 +298,10 @@ function renderMaterialsPage() {
   content.innerHTML = '';
 
   const page = mk('div', { class: 'cat-page' });
+  pendingRail = null;
   page.appendChild(buildTreePanel());
   page.appendChild(buildCatMain());
+  page.appendChild(pendingRail || buildSideRail());   // 右栏：页面级图标工具栏
   content.appendChild(page);
 }
 
@@ -554,11 +584,10 @@ function buildMaterialsPanel(cat) {
 
   panel.appendChild(bar);
 
-  // 表格 + 右侧批量操作栏
+  // 表格区域（图标工具栏在 renderMaterialsPage 里作为页面第三列）
   const body = mk('div', { class: 'materials-body' });
   const tableWrap = mk('div', { class: 'table-wrap', id: 'materialsTableWrap' });
   body.appendChild(tableWrap);
-  body.appendChild(buildSideRail());
   panel.appendChild(body);
 
   renderMaterialsTable(tableWrap, cat, info);
@@ -583,6 +612,10 @@ function buildSideRail() {
   move.disabled = !state.checked.size;
   move.addEventListener('click', () => openBatchMoveDialog());
 
+  const copy = mk('button', { class: 'rail-btn', title: '复制选中物料（先勾选 1 条）' }, '⧉');
+  copy.disabled = state.checked.size !== 1;
+  copy.addEventListener('click', () => doCopyMaterial());
+
   const del = mk('button', { class: 'rail-btn danger-hover', title: '批量删除（先勾选）' }, '✕');
   del.disabled = !state.checked.size;
   del.addEventListener('click', () => doBatchDelete());
@@ -592,6 +625,7 @@ function buildSideRail() {
   rail.appendChild(imp);
   rail.appendChild(exp);
   rail.appendChild(sep());
+  rail.appendChild(copy);
   rail.appendChild(move);
   rail.appendChild(del);
   return rail;
@@ -832,6 +866,141 @@ async function doDeleteMaterial(m) {
 }
 
 // ---------- 批量操作 ----------
+// 复制选中物料：新编码、同分组、属性值深拷贝，名称加「（副本）」
+async function doCopyMaterial() {
+  const ids = Array.from(state.checked);
+  if (ids.length !== 1) { toastErr('请先勾选 1 条物料再复制'); return; }
+  const src = state.materials.find(m => m.id === ids[0]);
+  if (!src) { toastErr('物料不存在'); return; }
+
+  const mat = {
+    id: mint('m'),
+    categoryId: src.categoryId || '',
+    code: nextMaterialCode(),
+    name: `${src.name || src.code}（副本）`,
+    attrs: clone(src.attrs || {}),
+    location: 'local',
+    syncedAt: '',
+    createdAt: nowISO(),
+    updatedAt: nowISO(),
+    createdBy: '',
+    updatedBy: '',
+  };
+  await saveMaterialDraft(mat, 'add');
+  state.checked.clear();
+  render();
+  toastOk(`已复制为 ${mat.code}`);
+}
+
+// ---------- 分组选择器（可搜索下拉） ----------
+// 分组多了以后原生下拉很难翻，这里用「输入过滤 + 下拉列表」：
+// 聚焦显示全部，输入即按路径模糊过滤，↑↓ 移动、Enter 选中、Esc 关闭。
+// 列表挂在 body 上 fixed 定位，避免被弹窗的滚动区裁剪；空间不足时自动向上展开。
+function buildCategoryPicker(options, currentValue) {
+  const opts = options.map(o => ({ id: o.id == null ? '' : String(o.id), label: o.label }));
+  const wrap = mk('div', { class: 'picker' });
+  const input = mk('input', { type: 'text', placeholder: '输入关键字过滤分组…', autocomplete: 'off', spellcheck: false });
+  const list = mk('div', { class: 'picker-list' });
+  wrap.appendChild(input);
+
+  let value = currentValue == null ? '' : String(currentValue);
+  let rows = [];
+  let hover = -1;
+
+  const labelOf = (v) => (opts.find(o => o.id === v) || {}).label || '';
+  const syncInput = () => { input.value = labelOf(value); };
+
+  function syncPos() {
+    const r = input.getBoundingClientRect();
+    const maxH = Math.min(220, window.innerHeight - 16);
+    list.style.left = r.left + 'px';
+    list.style.width = r.width + 'px';
+    const below = window.innerHeight - r.bottom - 8;
+    const up = below < 120 && r.top > below;
+    if (up) {
+      list.style.top = '';
+      list.style.bottom = (window.innerHeight - r.top + 4) + 'px';
+    } else {
+      list.style.bottom = '';
+      list.style.top = (r.bottom + 4) + 'px';
+    }
+  }
+  const onWinChange = () => { if (list.classList.contains('open')) syncPos(); };
+
+  function openList() {
+    if (list.classList.contains('open')) return;
+    document.body.appendChild(list);
+    list.classList.add('open');
+    syncPos();
+    window.addEventListener('resize', onWinChange);
+    window.addEventListener('scroll', onWinChange, true);
+  }
+  function closeList() {
+    list.classList.remove('open');
+    list.remove();
+    window.removeEventListener('resize', onWinChange);
+    window.removeEventListener('scroll', onWinChange, true);
+  }
+
+  function setHover(i) {
+    hover = i;
+    rows.forEach((r, idx) => r.classList.toggle('hover', idx === i));
+    if (rows[i]) rows[i].scrollIntoView({ block: 'nearest' });
+  }
+
+  function paint(keyword) {
+    list.innerHTML = '';
+    rows = [];
+    hover = -1;
+    const kw = String(keyword || '').trim().toLowerCase();
+    const hit = opts.filter(o => !kw || o.label.toLowerCase().includes(kw));
+    if (!hit.length) { list.appendChild(mk('div', { class: 'picker-empty' }, '没有匹配的分组')); return; }
+    for (const o of hit) {
+      const row = mk('div', { class: 'picker-item' + (o.id === value ? ' active' : ''), title: o.label }, o.label);
+      row.__opt = o;
+      row.addEventListener('mouseenter', () => setHover(rows.indexOf(row)));
+      row.addEventListener('mousedown', (e) => { e.preventDefault(); choose(o); });
+      rows.push(row);
+      list.appendChild(row);
+    }
+  }
+
+  function choose(o) {
+    value = o.id;
+    syncInput();
+    closeList();
+    input.blur();
+  }
+
+  input.addEventListener('focus', () => {
+    openList();
+    paint('');
+    input.select();
+    setHover(rows.findIndex(r => r.classList.contains('active')));
+  });
+  input.addEventListener('input', () => { openList(); paint(input.value); syncPos(); });
+  input.addEventListener('blur', () => { closeList(); syncInput(); });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (!list.classList.contains('open')) { openList(); paint(''); }
+      if (rows.length) setHover((hover + 1) % rows.length);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (rows.length) setHover((hover - 1 + rows.length) % rows.length);
+    } else if (e.key === 'Enter') {
+      if (hover >= 0 && rows[hover]) { e.preventDefault(); choose(rows[hover].__opt); }
+    } else if (e.key === 'Escape') {
+      closeList();
+      syncInput();
+      input.blur();
+    }
+  });
+
+  syncInput();
+  return { el: wrap, get value() { return value; } };
+}
+
 function openBatchMoveDialog() {
   const ids = Array.from(state.checked);
   if (!ids.length) { toastErr('请先勾选物料'); return; }
@@ -840,12 +1009,11 @@ function openBatchMoveDialog() {
   const body = mk('div');
   body.appendChild(mk('p', { class: 'muted' }, `已选 ${ids.length} 条物料，转移到：`));
 
-  const sel = mk('select', { style: 'width:100%;padding:6px 10px;border:1px solid var(--border-strong);border-radius:6px;' });
-  sel.appendChild(mk('option', { value: UNGROUPED }, '未分组'));
-  const grouped = leaves.map(c => ({ id: c.id, label: Cat.categoryPathString(state.categories, c.id) }))
-    .sort((a, b) => a.label.localeCompare(b.label, 'zh'));
-  for (const c of grouped) sel.appendChild(mk('option', { value: c.id }, c.label));
-  body.appendChild(sel);
+  const opts = [{ id: UNGROUPED, label: '未分组' }]
+    .concat(leaves.map(c => ({ id: c.id, label: Cat.categoryPathString(state.categories, c.id) }))
+      .sort((a, b) => a.label.localeCompare(b.label, 'zh')));
+  const picker = buildCategoryPicker(opts, UNGROUPED);
+  body.appendChild(picker.el);
 
   openModal({
     title: '批量转移分组',
@@ -855,7 +1023,7 @@ function openBatchMoveDialog() {
       {
         label: '确认转移', className: 'primary',
         onClick: async () => {
-          const target = sel.value;
+          const target = picker.value;
           for (const id of ids) {
             const m = state.materials.find(x => x.id === id);
             if (!m) continue;
@@ -1256,8 +1424,8 @@ function buildManagePanel(cat) {
   rail.appendChild(copyBtn);
 
   body.appendChild(formCol);
-  body.appendChild(rail);
   panel.appendChild(body);
+  pendingRail = rail;   // 保存/删除/复制 挂到页面右栏
   return panel;
 }
 
@@ -1299,13 +1467,8 @@ async function doCopyCategory(cat) {
   body.appendChild(nameInput);
 
   body.appendChild(mk('label', {}, '复制到'));
-  const parentSel = mk('select');
-  for (const p of parentOptions) {
-    const o = mk('option', { value: p.id || '' }, p.label);
-    if ((cat.parentId || '') === (p.id || '')) o.selected = true;
-    parentSel.appendChild(o);
-  }
-  body.appendChild(parentSel);
+  const parentSel = buildCategoryPicker(parentOptions, cat.parentId || '');
+  body.appendChild(parentSel.el);
 
   body.appendChild(mk('label', {}, '复制内容'));
   const onlyChk = mk('input', { type: 'radio', name: 'copyMode', value: 'group', checked: true });
@@ -1553,24 +1716,13 @@ function openCategoryDialog(parentId) {
 // ---------- 系统设置：字典设置 + 属性集合 ----------
 function renderSettings() {
   const content = document.getElementById('content');
-  content.className = 'content scroll';
+  content.className = 'content setting-page';
   content.innerHTML = '';
 
-  const tabs = mk('div', { class: 'subtabs' });
-  const tabDefs = [
-    { key: 'dict', label: `字典设置（${state.dictionaries.length}）` },
-    { key: 'set', label: `属性集合（${state.attrSets.length}）` },
-  ];
   if (!state.settingTab) state.settingTab = 'dict';
-  for (const t of tabDefs) {
-    const b = mk('button', { class: `subtab ${state.settingTab === t.key ? 'active' : ''}` }, t.label);
-    b.addEventListener('click', () => { state.settingTab = t.key; render(); });
-    tabs.appendChild(b);
-  }
-  content.appendChild(tabs);
-
-  if (state.settingTab === 'dict') content.appendChild(buildDictionarySection());
-  else content.appendChild(buildAttrSetSection());
+  pendingRail = null;
+  content.appendChild(state.settingTab === 'dict' ? buildDictionarySection() : buildAttrSetSection());
+  if (pendingRail) content.appendChild(pendingRail);   // 右栏：图标工具栏
 }
 
 // ----- 字典设置 -----
@@ -1579,99 +1731,239 @@ function buildDictionarySection() {
   wrap.appendChild(mk('div', { class: 'hint' },
     '字典是给「下拉单选 / 单选 / 多选」类型属性提供选项的选项库，改一次所有引用它的字段一起生效。'));
 
-  if (!state.dictionaries.length) {
-    wrap.appendChild(mk('div', { class: 'empty', style: 'padding:20px;' }, '还没有字典'));
-  }
+  const bar = mk('div', { class: 'toolbar' });
+  const search = mk('input', { type: 'search', placeholder: '搜索字典名称 / 选项' });
+  search.value = state.dictSearch || '';
+  bar.appendChild(search);
+  const info = mk('span', { class: 'hint' });
+  bar.appendChild(info);
+  wrap.appendChild(bar);
 
-  for (const dict of state.dictionaries) {
-    const card = mk('div', { class: 'dict-card' });
-    const head = mk('div', { class: 'dict-head' });
-    const nameInput = mk('input', { type: 'text', value: dict.name, class: 'dict-name' });
-    head.appendChild(nameInput);
-    head.appendChild(mk('span', { class: 'muted' }, `${dict.items.length} 项`));
+  const tableWrap = mk('div', { class: 'table-wrap' });
+  wrap.appendChild(tableWrap);
 
-    const usedBy = [
-      ...state.categories.flatMap(c => (c.attrs || []).map(a => ({ a, c }))),
-      ...state.attrSets.flatMap(s => (s.attrs || []).map(a => ({ a, c: { name: '集合：' + s.name } }))),
-    ].filter(x => x.a.dictId === dict.id);
-    if (usedBy.length) {
-      head.appendChild(mk('span', { class: 'from-tag' }, `被 ${usedBy.length} 个字段引用`));
+  const selected = () => Array.from(state.dictChecked)
+    .map(id => state.dictionaries.find(d => d.id === id)).filter(Boolean);
+
+  pendingRail = buildSettingRail({
+    label: '字典',
+    count: state.dictChecked.size,
+    onNew: () => openDictionaryDialog(null),
+    onEdit: () => openDictionaryDialog(selected()[0]),
+    onCopy: () => doCopyDictionary(selected()[0]),
+    onDelete: () => doDeleteDictionary(selected()[0], dictUsedBy(selected()[0])),
+  });
+
+  const renderTable = () => {
+    const kw = (state.dictSearch || '').trim().toLowerCase();
+    const list = state.dictionaries.filter(d => !kw || d.name.toLowerCase().includes(kw)
+      || (d.items || []).some(i => `${i.label} ${i.value}`.toLowerCase().includes(kw)));
+    tableWrap.innerHTML = '';
+    info.textContent = `共 ${list.length} 个`;
+    if (!list.length) {
+      tableWrap.appendChild(mk('div', { class: 'empty', style: 'padding:24px;' },
+        kw ? '没有匹配的字典' : '还没有字典'));
+      return;
     }
 
-    const delBtn = mk('button', { class: 'btn danger small' }, '删除字典');
-    delBtn.addEventListener('click', () => doDeleteDictionary(dict, usedBy));
-    head.appendChild(delBtn);
-    card.appendChild(head);
-
-    // 字典项
-    const itemWrap = mk('div', { class: 'dict-items' });
-    const rows = [];
-    const addItemRow = (item) => {
-      const row = mk('div', { class: 'dict-item-row' });
-      const labelInput = mk('input', { type: 'text', value: item?.label || '', placeholder: '显示名，如 35平方' });
-      const valueInput = mk('input', { type: 'text', value: item?.value || '', placeholder: '存储值，如 35' });
-      const rm = mk('button', { class: 'btn danger small', type: 'button' }, '删');
-      row.appendChild(labelInput);
-      row.appendChild(valueInput);
-      rm.addEventListener('click', () => { row.remove(); });
-      row.appendChild(rm);
-      itemWrap.appendChild(row);
-      rows.push({ row, labelInput, valueInput });
-    };
-    for (const it of dict.items) addItemRow(it);
-    const head2 = mk('div', { class: 'dict-item-row dict-item-head' });
-    head2.appendChild(mk('span', { class: 'muted' }, '显示名'));
-    head2.appendChild(mk('span', { class: 'muted' }, '存储值'));
-    head2.appendChild(mk('span', {}));
-    itemWrap.insertBefore(head2, itemWrap.firstChild);
-    card.appendChild(itemWrap);
-
-    const actions = mk('div', { class: 'dict-actions' });
-    const addBtn = mk('button', { class: 'btn small', type: 'button' }, '＋ 添加选项');
-    addBtn.addEventListener('click', () => addItemRow({ label: '', value: '' }));
-    actions.appendChild(addBtn);
-
-    const saveBtn = mk('button', { class: 'btn primary small' }, '保存字典');
-    saveBtn.addEventListener('click', async () => {
-      const name = nameInput.value.trim();
-      if (!name) { toastErr('字典名称必填'); return; }
-      if (state.dictionaries.some(d => d.id !== dict.id && d.name === name)) {
-        toastErr('字典名称已存在'); return;
-      }
-      const items = [];
-      for (const r of rows) {
-        if (!r.row.isConnected) continue;
-        const label = r.labelInput.value.trim();
-        const value = r.valueInput.value.trim();
-        if (!label && !value) continue;
-        if (!value) { toastErr('存储值不能为空'); return; }
-        if (items.some(i => i.value === value)) { toastErr(`存储值「${value}」重复`); return; }
-        items.push({ value, label: label || value });
-      }
-      const d = draftOf('dictionary', dict.id);
-      await saveDictionaryDraft({ ...dict, name, items }, d?.op === 'add' ? 'add' : 'update');
-      render();
-      toastOk('字典已保存为草稿');
+    const table = mk('table', { class: 'grid' });
+    const head = mk('tr');
+    ['', '字典名称', '选项数', '选项预览', '被引用', '操作'].forEach((t, i) => {
+      const th = mk('th', {}, t);
+      if (i === 5) th.className = 'col-ops';
+      head.appendChild(th);
     });
-    actions.appendChild(saveBtn);
-    card.appendChild(actions);
+    table.appendChild(head);
 
-    wrap.appendChild(card);
-  }
+    for (const dict of list) {
+      const usedBy = dictUsedBy(dict);
+      const tr = mk('tr');
+      const cb = mk('input', { type: 'checkbox' });
+      cb.checked = state.dictChecked.has(dict.id);
+      cb.addEventListener('change', () => {
+        state.dictChecked.delete(dict.id);
+        if (cb.checked) state.dictChecked.add(dict.id);
+        render();
+      });
+      const chkTd = mk('td');
+      chkTd.appendChild(cb);
+      tr.appendChild(chkTd);
+      tr.appendChild(mk('td', { class: 'plain' }, dict.name));
+      tr.appendChild(mk('td', {}, String((dict.items || []).length)));
+      tr.appendChild(mk('td', { class: 'wrap' }, (dict.items || []).map(i => i.label).join('、') || '—'));
+      tr.appendChild(mk('td', {}, usedBy.length ? `${usedBy.length} 个字段` : '—'));
 
-  const newBtn = mk('button', { class: 'btn' }, '＋ 新建字典');
-  newBtn.addEventListener('click', async () => {
-    let i = state.dictionaries.length + 1;
-    while (state.dictionaries.some(d => d.name === `新字典${i}`)) i++;
-    await saveDictionaryDraft({ id: mint('dict'), name: `新字典${i}`, items: [] }, 'add');
-    render();
-    toast('已创建，改好名称和选项后点「保存字典」');
-  });
-  wrap.appendChild(newBtn);
+      const ops = mk('td', { class: 'col-ops' });
+      const edit = mk('button', { class: 'link-btn' }, '编辑');
+      edit.addEventListener('click', () => openDictionaryDialog(dict));
+      const del = mk('button', { class: 'link-btn danger' }, '删除');
+      del.addEventListener('click', () => doDeleteDictionary(dict, usedBy));
+      ops.appendChild(edit);
+      ops.appendChild(del);
+      tr.appendChild(ops);
+      table.appendChild(tr);
+    }
+    tableWrap.appendChild(table);
+  };
+
+  search.addEventListener('input', () => { state.dictSearch = search.value; renderTable(); });
+  renderTable();
   return wrap;
 }
 
+// 设置类页面右侧操作栏：新建 / 编辑 / 复制 / 删除（后三项需选中 1 项）
+function buildSettingRail({ label, count, onNew, onEdit, onCopy, onDelete }) {
+  const rail = mk('div', { class: 'side-rail' });
+  const sep = () => mk('div', { class: 'rail-sep' });
+  const one = count === 1;
+
+  const add = mk('button', { class: 'rail-btn', title: `新建${label}` }, '＋');
+  add.addEventListener('click', onNew);
+
+  const edit = mk('button', { class: 'rail-btn', title: `编辑${label}（先勾选 1 项）` }, '✎');
+  edit.disabled = !one;
+  edit.addEventListener('click', onEdit);
+
+  const copy = mk('button', { class: 'rail-btn', title: `复制${label}（先勾选 1 项）` }, '⧉');
+  copy.disabled = !one;
+  copy.addEventListener('click', onCopy);
+
+  const del = mk('button', { class: 'rail-btn danger-hover', title: `删除${label}（先勾选 1 项）` }, '✕');
+  del.disabled = !one;
+  del.addEventListener('click', onDelete);
+
+  rail.appendChild(add);
+  rail.appendChild(sep());
+  rail.appendChild(edit);
+  rail.appendChild(copy);
+  rail.appendChild(sep());
+  rail.appendChild(del);
+  return rail;
+}
+
+// 复制字典：名称加「（副本）」，选项深拷贝
+async function doCopyDictionary(src) {
+  if (!src) return;
+  let name = `${src.name} 副本`;
+  let i = 2;
+  while (state.dictionaries.some(d => d.name === name)) name = `${src.name} 副本${i++}`;
+  const id = mint('dict');
+  await saveDictionaryDraft({
+    id,
+    name,
+    items: (src.items || []).map(x => ({ ...x })),
+  }, 'add');
+  state.dictChecked = new Set([id]);
+  render();
+  toastOk(`已复制为「${name}」`);
+}
+
+// 复制属性集合：名称加「（副本）」，属性定义深拷贝
+async function doCopyAttrSet(src) {
+  if (!src) return;
+  let name = `${src.name} 副本`;
+  let i = 2;
+  while (state.attrSets.some(s => s.name === name)) name = `${src.name} 副本${i++}`;
+  const id = mint('set');
+  await saveAttrSetDraft({
+    id,
+    name,
+    attrs: (src.attrs || []).map(a => ({ ...a })),
+  }, 'add');
+  state.setChecked = new Set([id]);
+  render();
+  toastOk(`已复制为「${name}」`);
+}
+
+// 字典被哪些字段引用（分组自有字段 + 属性集合字段）
+function dictUsedBy(dict) {
+  return [
+    ...state.categories.flatMap(c => (c.attrs || []).map(a => ({ a, c }))),
+    ...state.attrSets.flatMap(s => (s.attrs || []).map(a => ({ a, c: { name: '集合：' + s.name } }))),
+  ].filter(x => x.a.dictId === dict.id);
+}
+
+// 字典编辑弹窗；dict 传 null 为新建
+function openDictionaryDialog(dict) {
+  const cur = dict
+    ? { id: dict.id, name: dict.name, items: (dict.items || []).map(i => ({ ...i })) }
+    : { id: mint('dict'), name: '', items: [] };
+
+  const body = mk('div');
+  const grid = mk('div', { class: 'form-grid' });
+  const nameInput = mk('input', { type: 'text', value: cur.name, placeholder: '字典名称，如 标称截面' });
+  const nameBox = fieldBox('字典名称', nameInput);
+  nameBox.classList.add('full');
+  nameBox.appendChild(mk('div', { class: 'hint' },
+    '显示名给用户看，存储值写进数据（留空则与显示名相同）'));
+  grid.appendChild(nameBox);
+  body.appendChild(grid);
+
+  const itemWrap = mk('div', { class: 'dict-items', style: 'margin-top:16px;' });
+  const head = mk('div', { class: 'dict-item-row dict-item-head' });
+  head.appendChild(mk('span', { class: 'muted' }, '显示名'));
+  head.appendChild(mk('span', { class: 'muted' }, '存储值'));
+  head.appendChild(mk('span', {}));
+  itemWrap.appendChild(head);
+
+  const rows = [];
+  const addItemRow = (item) => {
+    const row = mk('div', { class: 'dict-item-row' });
+    const labelInput = mk('input', { type: 'text', value: item?.label || '', placeholder: '显示名，如 35平方' });
+    const valueInput = mk('input', { type: 'text', value: item?.value || '', placeholder: '存储值，如 35' });
+    const rm = mk('button', { class: 'btn danger small', type: 'button' }, '删');
+    rm.addEventListener('click', () => { row.remove(); });
+    row.appendChild(labelInput);
+    row.appendChild(valueInput);
+    row.appendChild(rm);
+    itemWrap.appendChild(row);
+    rows.push({ row, labelInput, valueInput });
+  };
+  for (const it of cur.items) addItemRow(it);
+  body.appendChild(itemWrap);
+
+  const addBtn = mk('button', { class: 'btn small', type: 'button', style: 'margin-top:8px;' }, '＋ 添加选项');
+  addBtn.addEventListener('click', () => addItemRow({ label: '', value: '' }));
+  body.appendChild(addBtn);
+
+  openModal({
+    title: dict ? `编辑字典「${dict.name}」` : '新建字典',
+    body,
+    actions: [
+      { label: '取消', onClick: closeModal },
+      {
+        label: '保存',
+        className: 'primary',
+        onClick: async () => {
+          const name = nameInput.value.trim();
+          if (!name) { toastErr('字典名称必填'); return; }
+          if (state.dictionaries.some(d => d.id !== cur.id && d.name === name)) {
+            toastErr('字典名称已存在'); return;
+          }
+          const items = [];
+          for (const r of rows) {
+            if (!r.row.isConnected) continue;
+            const label = r.labelInput.value.trim();
+            const value = r.valueInput.value.trim();
+            if (!label && !value) continue;
+            if (!value) { toastErr('存储值不能为空'); return; }
+            if (items.some(i => i.value === value)) { toastErr(`存储值「${value}」重复`); return; }
+            items.push({ value, label: label || value });
+          }
+          const d = draftOf('dictionary', cur.id);
+          await saveDictionaryDraft({ id: cur.id, name, items },
+            (!dict || d?.op === 'add') ? 'add' : 'update');
+          closeModal();
+          render();
+          toastOk('字典已保存为草稿');
+        },
+      },
+    ],
+  });
+}
+
 async function doDeleteDictionary(dict, usedBy) {
+  if (!dict) return;
   if (usedBy.length) {
     const where = usedBy.slice(0, 5).map(x => `「${x.c.name}」的「${x.a.label}」`).join('、');
     toastErr(`该字典正被 ${usedBy.length} 个字段引用（${where}${usedBy.length > 5 ? ' 等' : ''}），请先改成其它字典`);
@@ -1693,62 +1985,139 @@ async function doDeleteDictionary(dict, usedBy) {
 function buildAttrSetSection() {
   const wrap = mk('div', { class: 'setting-block' });
   wrap.appendChild(mk('div', { class: 'hint' },
-    '属性集合是一整套属性模板：在分组管理里「关联」后，该分组的物料属性 / 给下级分组的属性由集合实时提供，改集合一次全部生效。'));
+    '属性集合是一整套属性模板：在分组管理里「关联」后，该分组的物料属性由集合实时提供，改集合一次全部生效。'));
 
-  if (!state.attrSets.length) {
-    wrap.appendChild(mk('div', { class: 'empty', style: 'padding:20px;' }, '还没有属性集合'));
-  }
+  const bar = mk('div', { class: 'toolbar' });
+  const search = mk('input', { type: 'search', placeholder: '搜索集合名称 / 属性' });
+  search.value = state.setSearch || '';
+  bar.appendChild(search);
+  const info = mk('span', { class: 'hint' });
+  bar.appendChild(info);
+  wrap.appendChild(bar);
 
-  for (const set of state.attrSets) {
-    const card = mk('div', { class: 'dict-card' });
-    const head = mk('div', { class: 'dict-head' });
-    const nameInput = mk('input', { type: 'text', value: set.name, class: 'dict-name' });
-    head.appendChild(nameInput);
-    const usedBy = state.categories.filter(c => c.attrSetId === set.id);
-    head.appendChild(mk('span', { class: 'muted' },
-      `${set.attrs.length} 个属性 · ${usedBy.length} 个分组在用`));
-    const delBtn = mk('button', { class: 'btn danger small' }, '删除集合');
-    delBtn.addEventListener('click', () => doDeleteAttrSet(set, usedBy));
-    head.appendChild(delBtn);
-    card.appendChild(head);
+  const tableWrap = mk('div', { class: 'table-wrap' });
+  wrap.appendChild(tableWrap);
 
-    const editor = renderAttrDefTable(set.attrs || [], state.dictionaries);
-    card.appendChild(editor.root);
+  const selected = () => Array.from(state.setChecked)
+    .map(id => state.attrSets.find(s => s.id === id)).filter(Boolean);
+  const usedByOf = (set) => state.categories.filter(c => c.attrSetId === set.id);
 
-    const actions = mk('div', { class: 'dict-actions' });
-    const saveBtn = mk('button', { class: 'btn primary small' }, '保存集合');
-    saveBtn.addEventListener('click', async () => {
-      const name = nameInput.value.trim();
-      if (!name) { toastErr('集合名称必填'); return; }
-      if (state.attrSets.some(s => s.id !== set.id && s.name === name)) { toastErr('集合名称已存在'); return; }
-      let attrs;
-      try { attrs = editor.read(); } catch (e) { toastErr(e.message); return; }
-      const keys = attrs.map(a => a.key);
-      if (new Set(keys).size !== keys.length) { toastErr('属性 key 不能重复'); return; }
-      const d = draftOf('attrSet', set.id);
-      await saveAttrSetDraft({ ...set, name, attrs }, d?.op === 'add' ? 'add' : 'update');
-      render();
-      toastOk('属性集合已保存为草稿');
-    });
-    actions.appendChild(saveBtn);
-    card.appendChild(actions);
-
-    wrap.appendChild(card);
-  }
-
-  const newBtn = mk('button', { class: 'btn' }, '＋ 新建属性集合');
-  newBtn.addEventListener('click', async () => {
-    let i = state.attrSets.length + 1;
-    while (state.attrSets.some(s => s.name === `新集合${i}`)) i++;
-    await saveAttrSetDraft({ id: mint('set'), name: `新集合${i}`, attrs: [] }, 'add');
-    render();
-    toast('已创建，改好名称和属性后点「保存集合」');
+  pendingRail = buildSettingRail({
+    label: '属性集合',
+    count: state.setChecked.size,
+    onNew: () => openAttrSetDialog(null),
+    onEdit: () => openAttrSetDialog(selected()[0]),
+    onCopy: () => doCopyAttrSet(selected()[0]),
+    onDelete: () => doDeleteAttrSet(selected()[0], usedByOf(selected()[0])),
   });
-  wrap.appendChild(newBtn);
+
+  const renderTable = () => {
+    const kw = (state.setSearch || '').trim().toLowerCase();
+    const list = state.attrSets.filter(s => !kw || s.name.toLowerCase().includes(kw)
+      || (s.attrs || []).some(a => `${a.label} ${a.key}`.toLowerCase().includes(kw)));
+    tableWrap.innerHTML = '';
+    info.textContent = `共 ${list.length} 个`;
+    if (!list.length) {
+      tableWrap.appendChild(mk('div', { class: 'empty', style: 'padding:24px;' },
+        kw ? '没有匹配的属性集合' : '还没有属性集合'));
+      return;
+    }
+
+    const table = mk('table', { class: 'grid' });
+    const head = mk('tr');
+    ['', '集合名称', '属性数', '属性预览', '使用分组', '操作'].forEach((t, i) => {
+      const th = mk('th', {}, t);
+      if (i === 5) th.className = 'col-ops';
+      head.appendChild(th);
+    });
+    table.appendChild(head);
+
+    for (const set of list) {
+      const usedBy = usedByOf(set);
+      const tr = mk('tr');
+      const cb = mk('input', { type: 'checkbox' });
+      cb.checked = state.setChecked.has(set.id);
+      cb.addEventListener('change', () => {
+        state.setChecked.delete(set.id);
+        if (cb.checked) state.setChecked.add(set.id);
+        render();
+      });
+      const chkTd = mk('td');
+      chkTd.appendChild(cb);
+      tr.appendChild(chkTd);
+      tr.appendChild(mk('td', { class: 'plain' }, set.name));
+      tr.appendChild(mk('td', {}, String((set.attrs || []).length)));
+      tr.appendChild(mk('td', { class: 'wrap' }, (set.attrs || []).map(a => a.label).join('、') || '—'));
+      tr.appendChild(mk('td', {}, usedBy.length ? `${usedBy.length} 个分组` : '—'));
+
+      const ops = mk('td', { class: 'col-ops' });
+      const edit = mk('button', { class: 'link-btn' }, '编辑');
+      edit.addEventListener('click', () => openAttrSetDialog(set));
+      const del = mk('button', { class: 'link-btn danger' }, '删除');
+      del.addEventListener('click', () => doDeleteAttrSet(set, usedBy));
+      ops.appendChild(edit);
+      ops.appendChild(del);
+      tr.appendChild(ops);
+      table.appendChild(tr);
+    }
+    tableWrap.appendChild(table);
+  };
+
+  search.addEventListener('input', () => { state.setSearch = search.value; renderTable(); });
+  renderTable();
   return wrap;
 }
 
+// 属性集合编辑弹窗；set 传 null 为新建
+function openAttrSetDialog(set) {
+  const cur = set
+    ? { id: set.id, name: set.name, attrs: (set.attrs || []).map(a => ({ ...a })) }
+    : { id: mint('set'), name: '', attrs: [] };
+
+  const body = mk('div');
+  const grid = mk('div', { class: 'form-grid' });
+  const nameInput = mk('input', { type: 'text', value: cur.name, placeholder: '集合名称，如 电缆通用属性' });
+  const nameBox = fieldBox('集合名称', nameInput);
+  nameBox.classList.add('full');
+  grid.appendChild(nameBox);
+  body.appendChild(grid);
+
+  const editor = renderAttrDefTable(cur.attrs, state.dictionaries);
+  editor.root.style.marginTop = '16px';
+  body.appendChild(editor.root);
+
+  openModal({
+    title: set ? `编辑属性集合「${set.name}」` : '新建属性集合',
+    body,
+    actions: [
+      { label: '取消', onClick: closeModal },
+      {
+        label: '保存',
+        className: 'primary',
+        onClick: async () => {
+          const name = nameInput.value.trim();
+          if (!name) { toastErr('集合名称必填'); return; }
+          if (state.attrSets.some(s => s.id !== cur.id && s.name === name)) {
+            toastErr('集合名称已存在'); return;
+          }
+          let attrs;
+          try { attrs = editor.read(); } catch (e) { toastErr(e.message); return; }
+          const keys = attrs.map(a => a.key);
+          if (new Set(keys).size !== keys.length) { toastErr('属性 key 不能重复'); return; }
+          const d = draftOf('attrSet', cur.id);
+          await saveAttrSetDraft({ id: cur.id, name, attrs },
+            (!set || d?.op === 'add') ? 'add' : 'update');
+          closeModal();
+          render();
+          toastOk('属性集合已保存为草稿');
+        },
+      },
+    ],
+  });
+}
+
 async function doDeleteAttrSet(set, usedBy) {
+  if (!set) return;
   if (usedBy.length) {
     toastErr(`该集合正被 ${usedBy.length} 个分组关联（${usedBy.slice(0, 3).map(c => '「' + c.name + '」').join('、')}${usedBy.length > 3 ? ' 等' : ''}），请先在这些分组里取消关联或脱离关联`);
     return;

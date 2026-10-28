@@ -83,6 +83,8 @@ export function openModal({ title, body, actions }) {
 export function closeModal() {
   document.getElementById('modalMask').classList.add('hidden');
   document.getElementById('modal').innerHTML = '';
+  // 弹窗内的可搜索下拉列表挂在 body 上，关弹窗时一并清掉
+  document.querySelectorAll('.picker-list.open').forEach(el => el.remove());
   _modalRef = null;
 }
 

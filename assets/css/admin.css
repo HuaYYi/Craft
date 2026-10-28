@@ -58,6 +58,19 @@ body {
 .nav-item:hover { background: var(--hover); }
 .nav-item.active { background: var(--hover); border-left-color: var(--primary); font-weight: 600; }
 
+/* 系统设置的子导航：默认收起，点父项展开；缩进 + 小字号，激活时只变主色不加粗 */
+.nav-item.nav-parent .nav-caret {
+  float: right; font-size: 10px; color: var(--text-muted);
+  transition: transform .15s; transform-origin: 40% 50%;
+}
+.nav.nav-open .nav-parent .nav-caret { transform: rotate(90deg); }
+.nav-item.nav-sub { display: none; padding-left: 30px; font-size: 12.5px; color: var(--text-muted); }
+.nav.nav-open .nav-item.nav-sub { display: block; }
+.nav-item.nav-sub.active {
+  background: transparent; border-left-color: transparent;
+  color: var(--primary); font-weight: 500;
+}
+
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .topbar {
   padding: 0 20px;
@@ -164,7 +177,7 @@ body {
 .tree-node.drop-after { box-shadow: inset 0 -2px 0 0 var(--primary); }
 .tree.drop-root { outline: 2px dashed var(--primary); outline-offset: -2px; }
 
-.cat-main { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 10px 14px; padding-right: 54px; position: relative; }
+.cat-main { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 10px 14px; }
 .tabs { display: flex; gap: 2px; margin-bottom: 0; }
 .tab {
   padding: 8px 14px; border: none; background: transparent; cursor: pointer;
@@ -248,7 +261,7 @@ table.grid tr:hover td.col-name, table.grid tr:hover td.col-ops { background: #f
 .link-btn.danger { color: var(--danger); }
 .link-btn + .link-btn { margin-left: 10px; }
 
-/* 页面右侧批量操作图标栏（参考图二最右侧） */
+/* 页面右侧批量操作图标栏：作为所在行布局的最后一列（左中右结构的右栏） */
 .materials-body { display: flex; flex: 1; min-height: 0; gap: 0; }
 .side-rail {
   width: 40px; flex-shrink: 0;
@@ -258,7 +271,6 @@ table.grid tr:hover td.col-name, table.grid tr:hover td.col-ops { background: #f
   border-radius: 0;
   display: flex; flex-direction: column; align-items: center;
   padding: 8px 0; gap: 2px;
-  position: absolute; top: 0; right: 0; bottom: 0;
 }
 .side-rail .rail-btn {
   width: 32px; height: 32px; border: none; background: transparent; cursor: pointer;
@@ -269,6 +281,11 @@ table.grid tr:hover td.col-name, table.grid tr:hover td.col-ops { background: #f
 .side-rail .rail-btn.danger-hover:hover:not(:disabled) { color: var(--danger); }
 .side-rail .rail-btn:disabled { opacity: .3; cursor: not-allowed; }
 .side-rail .rail-sep { width: 20px; height: 1px; background: var(--border); margin: 4px 0; }
+/* 系统设置页：左内容 + 右图标栏，图标栏贴页面右边缘贯通整列（与物料页同一套三栏思路） */
+.content.setting-page { display: flex; flex-direction: row; padding: 0; }
+.content.setting-page > .setting-block {
+  flex: 1; min-width: 0; min-height: 0; padding: 16px 20px 0;
+}
 
 /* 有未提交改动的行：只在首列加一条细色带，不整行变色 */
 tr.dirty td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
@@ -355,6 +372,30 @@ tr.dirty td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
 .range-box { display: flex; align-items: center; gap: 8px; }
 .range-box input { width: 110px; }
 
+/* ========= 分组选择器（可搜索下拉，用于转移/复制分组） ========= */
+.picker { position: relative; }
+.picker input {
+  width: 100%; padding: 6px 10px;
+  border: 1px solid var(--border-strong); border-radius: var(--radius);
+  font-size: 13px; font-family: inherit;
+  background: var(--surface); color: var(--text);
+}
+.picker input:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 2px rgba(9,105,218,.12); }
+.picker-list {
+  display: none;
+  position: fixed; z-index: 300;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow); max-height: 220px; overflow-y: auto;
+}
+.picker-list.open { display: block; }
+.picker-item {
+  padding: 7px 10px; font-size: 13px; cursor: pointer;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.picker-item.hover { background: var(--hover); }
+.picker-item.active { color: var(--primary); font-weight: 600; }
+.picker-empty { padding: 8px 10px; font-size: 12px; color: var(--text-muted); }
+
 /* ========= 弹窗 ========= */
 .modal-mask {
   position: fixed; inset: 0; background: rgba(0,0,0,.38);
@@ -429,28 +470,17 @@ tr.dirty td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
 .settings-form .hint { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
 .hint { font-size: 12px; color: var(--text-muted); }
 
-/* 系统设置：子标签 */
-.subtabs { display: flex; gap: 4px; margin-bottom: 14px; }
-.subtab {
-  padding: 6px 12px; font-size: 13px; cursor: pointer;
-  border: 1px solid var(--border-strong); background: #fff; border-radius: var(--radius);
-  color: var(--text-muted);
-}
-.subtab:hover { background: var(--hover); }
-.subtab.active { color: var(--primary); border-color: var(--primary); font-weight: 600; }
-
-/* 系统设置：字典 / 属性集合卡片 */
-.setting-block { display: flex; flex-direction: column; gap: 14px; max-width: 860px; }
-.dict-card { border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; }
-.dict-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-.dict-name { flex: 1; max-width: 260px; padding: 6px 10px; font-size: 13px;
-  border: 1px solid var(--border-strong); border-radius: var(--radius); }
+/* 系统设置：字典 / 属性集合（表格列表 + 弹窗编辑） */
+.setting-block { display: flex; flex-direction: column; gap: 10px; }
+/* 名称列用正文字体，其余列沿用表格的等宽灰字 */
+table.grid td.plain { font-family: inherit; font-size: 13px; color: var(--text); }
 .dict-items { display: flex; flex-direction: column; gap: 6px; }
 .dict-item-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; align-items: center; }
-.dict-item-row input { padding: 5px 8px; font-size: 13px;
-  border: 1px solid var(--border-strong); border-radius: 4px; }
+.dict-item-row input { padding: 6px 10px; font-size: 13px;
+  border: 1px solid var(--border-strong); border-radius: var(--radius);
+  background: var(--surface); color: var(--text); font-family: inherit; }
+.dict-item-row input:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 2px rgba(9,105,218,.12); }
 .dict-item-head { font-size: 12px; }
-.dict-actions { display: flex; gap: 8px; margin-top: 10px; }
 
 /* 分组管理：属性集合关联 */
 .assign-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
