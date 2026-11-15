@@ -67,6 +67,17 @@ const nowISO = () => new Date().toISOString();
 let pendingRail = null;
 
 // 物料编码在提交时才分配：按远端最新索引算当天最大流水，避免多人同时编辑重号
+// 未提交的新物料先用「待提交-哈希」做临时编码，便于识别和沟通
+function tempCode(id) {
+  let h = 0;
+  for (const ch of String(id)) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return '待提交' + h.toString(16).toUpperCase().padStart(6, '0').slice(-6);
+}
+
+function isTempCode(code) {
+  return String(code || '').startsWith('待提交');
+}
+
 function todayPrefix() {
   const d = new Date();
   return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
@@ -90,21 +101,25 @@ async function prepareDraftsWithCodes(drafts) {
     if (Number.isInteger(seq) && seq > maxSeq) maxSeq = seq;
   };
   for (const code of used) bump(code);
-  // 导入时自带编码的新物料保留原编码，只给空编码的分配
+  // 导入时自带编码的新物料保留原编码，只给空编码/临时编码的分配
   for (const draft of adds) {
     const code = String(draft.data?.code || '').trim();
-    if (code) { used.add(code); bump(code); }
+    if (code && !isTempCode(code)) { used.add(code); bump(code); }
   }
 
   const assigned = new Map();
   for (const draft of adds) {
-    if (String(draft.data?.code || '').trim()) continue;
+    const rawCode = String(draft.data?.code || '').trim();
+    if (rawCode && !isTempCode(rawCode)) continue;
     let seq = maxSeq + 1;
-    let code = prefix + String(seq).padStart(4, '0');
-    while (used.has(code)) { seq += 1; code = prefix + String(seq).padStart(4, '0'); }
+    let assignedCode = prefix + String(seq).padStart(4, '0');
+    while (used.has(assignedCode)) {
+      seq += 1;
+      assignedCode = prefix + String(seq).padStart(4, '0');
+    }
     maxSeq = seq;
-    used.add(code);
-    assigned.set(draft.id, code);
+    used.add(assignedCode);
+    assigned.set(draft.id, assignedCode);
   }
   return drafts.map(draft =>
     assigned.has(draft.id) ? { ...draft, data: { ...draft.data, code: assigned.get(draft.id) } } : draft);
@@ -970,7 +985,7 @@ async function renderMaterialsTable(panel, cat) {
     tdChk.appendChild(chk);
     tr.appendChild(tdChk);
 
-    tr.appendChild(mk('td', { class: 'col-code' + (m.code ? '' : ' muted') }, m.code || '待生成'));
+    tr.appendChild(mk('td', { class: 'col-code' + (isTempCode(m.code) ? ' muted' : '') }, m.code || '待提交'));
     tr.appendChild(mk('td', { class: 'col-name' }, m.name || ''));
     for (const def of attrDefs) {
       tr.appendChild(mk('td', { class: 'wrap col-attr' }, Cat.fmtAttrValue(def, m.attrs?.[def.key])));
@@ -1051,10 +1066,11 @@ function openMaterialDialog(mat) {
   // 末级分组的生效字段（属性集合 + 自有字段），选项来自字典
   const defs = fieldsOf(attrsOf(cat));
 
+  const newId = mint('m');
   let current = mat
     ? clone(mat)
     : {
-        id: mint('m'), categoryId: catId || UNGROUPED, code: '', name: '',
+        id: newId, categoryId: catId || UNGROUPED, code: tempCode(newId), name: '',
         attrs: {}, location: 'local', syncedAt: '',
         createdAt: nowISO(), updatedAt: nowISO(), createdBy: '', updatedBy: '',
       };
@@ -1074,11 +1090,10 @@ function openMaterialDialog(mat) {
   const codeInput = form.root.querySelector('#f-code');
   if (codeInput) {
     codeInput.readOnly = true;
-    codeInput.placeholder = '提交后自动生成';
-    codeInput.title = '编码在提交时统一生成，避免多人同时编辑重号';
+    codeInput.title = '临时编码，提交时自动生成正式编码';
   }
   body.appendChild(mk('div', { class: 'muted', style: 'margin-top:6px;font-size:12px;' },
-    isNew ? '物料编码在提交后按「年月日 + 四位流水号」生成' : '物料编码按「年月日 + 四位流水号」自动生成'));
+    isNew ? '暂用临时编码，提交后按「年月日 + 四位流水号」生成正式编码' : '物料编码按「年月日 + 四位流水号」自动生成'));
 
   // 保存状态（只读）：有未提交草稿=未保存，与仓库一致=已保存
   const locLine = mk('div', { class: 'muted', style: 'margin-top:12px;font-size:12px;' });
@@ -1159,10 +1174,11 @@ async function doCopyMaterial() {
   const src = await getMaterialById(ids[0]);
   if (!src) { toastErr('物料不存在'); return; }
 
+  const copyId = mint('m');
   const mat = {
-    id: mint('m'),
+    id: copyId,
     categoryId: src.categoryId || '',
-    code: '',
+    code: tempCode(copyId),
     name: `${src.name || src.code}（副本）`,
     attrs: clone(src.attrs || {}),
     location: 'local',
@@ -1407,14 +1423,15 @@ async function openImportPreview(rows, fileName) {
       if (parsed !== undefined) importedAttrs[def.key] = parsed;
     }
 
+    const rowId = existing?.id || row.id || mint('m');
     const data = {
       ...(existing || {
-        id: row.id || mint('m'),
+        id: rowId,
         createdAt: nowISO(), createdBy: '', updatedBy: '',
         location: 'local', syncedAt: '', attrs: {},
       }),
       categoryId: targetCatId,
-      code: row.code || existing?.code || '',
+      code: row.code || existing?.code || tempCode(rowId),
       name: row.name || existing?.name || '',
       // Excel 里有值的属性覆盖，Excel 为空的保留原值（避免把已有数据清空）
       attrs: { ...(existing?.attrs || {}), ...importedAttrs },
@@ -1817,28 +1834,16 @@ async function doCopyCategory(cat) {
             });
           for (const nc of newCats) await saveCategoryDraft(nc, 'add');
 
-          // 2) 物料：新编码（当天流水号顺延），挂到复制出来的分组上
+          // 2) 物料：先用临时编码，提交时统一分配正式编码
           let newMatCount = 0;
           if (allChk.checked && matsInTree.length) {
-            const d = new Date();
-            const prefix = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
-            const used = new Set();
-            for (const m of state.materials) {
-              const code = String(m.code || '');
-              if (!code.startsWith(prefix)) continue;
-              const seq = Number(code.slice(prefix.length));
-              if (Number.isInteger(seq) && seq > 0) used.add(seq);
-            }
-            let seq = 1;
             for (const m of matsInTree) {
-              while (used.has(seq)) seq++;
-              const code = prefix + String(seq).padStart(4, '0');
-              used.add(seq);
+              const copyId = mint('m');
               await saveMaterialDraft({
                 ...clone(m),
-                id: mint('m'),
+                id: copyId,
                 categoryId: idMap.get(m.categoryId),
-                code,
+                code: tempCode(copyId),
                 attrs: clone(m.attrs || {}),
                 location: 'local',
                 syncedAt: '',
@@ -2549,7 +2554,7 @@ function draftLabel(d) {
     return `【属性集合】${opText} ${d.data?.name || d.recordId}（${d.data?.attrs?.length || 0} 个属性）`;
   }
   const catName = d.data?.categoryId ? Cat.categoryPathString(state.categories, d.data.categoryId) : '';
-  return `【物料】${opText} ${d.data?.code || '待生成'}${d.data?.name ? ' ' + d.data.name : ''}${catName ? '（' + catName + '）' : ''}`;
+  return `【物料】${opText} ${d.data?.code || '待提交'}${d.data?.name ? ' ' + d.data.name : ''}${catName ? '（' + catName + '）' : ''}`;
 }
 
 async function discardAllDrafts() {
