@@ -15,7 +15,7 @@
 //
 // 视图：materials（物料及分组） / settings（设置） / commit（提交管理）
 
-import { CONFIG, LOCATION, FIELD_TYPES } from './config.js';
+import { CONFIG, FIELD_TYPES } from './config.js';
 import * as Store from './store.js';
 import * as GH from './github.js';
 import * as Auth from './auth.js';
@@ -108,6 +108,14 @@ async function init() {
   state.user = Auth.getUser();
   state.settings = GH.getRepoSettings();
 
+  // 账号信息缺失（例如只保留了 PAT）时重新取一次，头像和编辑人才能正常显示
+  if (!state.user?.login) {
+    try {
+      Auth.saveUser(await GH.validateToken(Auth.getToken()));
+      state.user = Auth.getUser();
+    } catch (_) { /* 网络异常时忽略，不影响进入系统 */ }
+  }
+
   await Store.requestPersistent();
 
   // 数据模型版本标记：仅记录，升级时默认保留全部本地数据，不做任何清理
@@ -134,7 +142,28 @@ function bindAccountBar() {
     chip.textContent = `${state.settings.owner}/${state.settings.repo}`;
     chip.title = `当前数据仓库 · 分支 ${state.settings.branch}`;
   }
-  document.getElementById('logoutBtn')?.addEventListener('click', async () => {
+
+  const displayName = state.user?.name || state.user?.login || '?';
+  const avatar = document.getElementById('avatarBtn');
+  const menu = document.getElementById('accountDropdown');
+  document.getElementById('accountName').textContent = displayName;
+  document.getElementById('accountRepo').textContent =
+    `数据仓库：${state.settings.owner}/${state.settings.repo} · ${state.settings.branch}`;
+  if (avatar) {
+    avatar.textContent = displayName.slice(0, 1).toUpperCase();
+    avatar.title = displayName;
+    avatar.addEventListener('click', e => {
+      e.stopPropagation();
+      menu.hidden = !menu.hidden;
+    });
+  }
+  document.addEventListener('click', e => {
+    if (menu && !menu.hidden && !e.target.closest('.account-menu')) menu.hidden = true;
+  });
+  document.getElementById('switchRepoBtn')?.addEventListener('click', () => {
+    location.assign('login.html?step=repos');
+  });
+  document.getElementById('menuLogoutBtn')?.addEventListener('click', async () => {
     if (await confirm('退出登录并清除本机保存的 PAT？', '退出登录')) Auth.logout();
   });
 }
@@ -151,7 +180,6 @@ function bindNav() {
       switchView(item.dataset.view, item.dataset.sub);
     });
   });
-  document.getElementById('commitLink').addEventListener('click', () => switchView('commit'));
   const saved = localStorage.getItem('craft.navOpen');
   toggleNavGroup(saved === '1');
 }
@@ -233,9 +261,7 @@ function switchView(view, sub) {
     const active = i.dataset.view === view && (!isSub || i.dataset.sub === curSub);
     i.classList.toggle('active', active);
   });
-  document.getElementById('commitLink').classList.toggle('active', view === 'commit');
-  const titles = { materials: '物料及分组', settings: '系统设置', commit: '提交管理' };
-  document.getElementById('topbarTitle').textContent = titles[view] || '';
+  const titles = { materials: '物料及分组', settings: '系统设置', commit: '提交管理' };  document.getElementById('topbarTitle').textContent = titles[view] || '';
   render();
 }
 
@@ -251,6 +277,8 @@ function render() {
 // ---------- 远端读取 ----------
 async function refreshRemote() {
   setLoading();
+  progressStart('连接数据仓库…');
+  const totalSteps = 2 + DATA_SETS.length + 2;
   try {
     const texts = {};
     state.missingDataFiles = [];
@@ -258,6 +286,7 @@ async function refreshRemote() {
     // 先确认仓库可访问，避免把“无权限”误判成“空仓库”
     try {
       await GH.getRepo(state.settings.owner, state.settings.repo);
+      progressSet(1, totalSteps, '读取数据…');
     } catch (e) {
       if (e.status === 401) {
         Auth.clearToken();
@@ -272,27 +301,41 @@ async function refreshRemote() {
       throw e;
     }
 
-    try {
-      state.remoteHead = await GH.getBranchHead(state.settings.branch);
-    } catch (_) { state.remoteHead = null; }
+    // 分支、三个设置文件、物料清单与搜索索引并行读取，减少串行往返
+    const [head, files, materialData] = await Promise.all([
+      GH.getBranchHead(state.settings.branch)
+        .catch(() => null)
+        .then(sha => { progressAdvance('读取分支…'); return sha; }),
+      Promise.all(DATA_SETS.map(s => GH.getFile(s.path).then(f => {
+        progressAdvance('读取数据…');
+        return f;
+      }))),
+      MaterialStore.loadRemote().then(data => {
+        progressAdvance('读取物料清单…');
+        progressAdvance('读取搜索索引…');
+        return data;
+      }),
+    ]);
 
-    for (const s of DATA_SETS) {
-      const f = await GH.getFile(s.path);
+    state.remoteHead = head;
+    DATA_SETS.forEach((s, i) => {
+      const f = files[i];
       texts[s.kind] = f ? f.content : null;
       if (!f) state.missingDataFiles.push(s.path);
-    }
+    });
 
     for (const s of DATA_SETS) {
       state[s.base] = texts[s.kind] ? safeParse(texts[s.kind], []) : [];
       state[s.raw] = texts[s.kind] || null;
     }
-    const materialData = await MaterialStore.loadRemote();
     state.baseMaterials = materialData.materials;
     state.missingDataFiles.push(...materialData.missingPaths);
   } catch (e) {
     console.warn('远端读取失败', e);
     state.missingDataFiles = [];
     toastErr('数据仓库读取失败：' + (e.message || e));
+  } finally {
+    progressEnd();
   }
 }
 
@@ -355,7 +398,11 @@ function applyDrafts() {
 
 function updateCommitBadge() {
   const initCount = state.missingDataFiles.length ? 1 : 0;
-  document.getElementById('commitLink').textContent = `提交管理(${state.drafts.length + initCount})`;
+  const count = state.drafts.length + initCount;
+  const el = document.getElementById('commitCount');
+  if (!el) return;
+  el.hidden = !count;
+  el.textContent = count;
 }
 
 async function saveCategoryDraft(cat, op) {
@@ -370,12 +417,20 @@ async function saveCategoryDraft(cat, op) {
 }
 
 async function saveMaterialDraft(mat, op) {
+  const who = state.user?.name || state.user?.login || '';
+  const next = {
+    ...mat,
+    createdAt: mat.createdAt || nowISO(),
+    updatedAt: mat.updatedAt || nowISO(),
+    createdBy: mat.createdBy || (op === 'add' ? who : ''),
+    updatedBy: who || mat.updatedBy || '',
+  };
   await Store.putDraft({
-    id: `material:${mat.id}`,
+    id: `material:${next.id}`,
     kind: 'material',
-    recordId: mat.id,
+    recordId: next.id,
     op,
-    data: clone(mat),
+    data: clone(next),
   });
   await loadDrafts();
 }
@@ -868,15 +923,15 @@ async function renderMaterialsTable(panel, cat) {
   const thChk = mk('th', { class: 'col-chk' });
   thChk.appendChild(chkAll);
   head.appendChild(thChk);
-  const headLabels = ['物料编码', '物料名称', ...attrDefs.map(d => d.label), '位置', '最近编辑'];
-  const headClasses = ['col-code', 'col-name', ...attrDefs.map(() => 'col-attr'), 'col-attr', 'col-attr'];
+  const headLabels = ['物料编码', '物料名称', ...attrDefs.map(d => d.label), '保存状态', '最近编辑', '编辑人'];
+  const headClasses = ['col-code', 'col-name', ...attrDefs.map(() => 'col-attr'), 'col-attr', 'col-attr', 'col-attr'];
   headLabels.forEach((t, i) => head.appendChild(mk('th', { class: headClasses[i] }, t)));
   head.appendChild(mk('th', { class: 'col-ops' }, '操作'));
   table.appendChild(head);
 
   if (!list.length) {
     const tr = mk('tr');
-    tr.appendChild(mk('td', { colspan: attrDefs.length + 6, class: 'empty' }, '暂无物料'));
+    tr.appendChild(mk('td', { colspan: attrDefs.length + 7, class: 'empty' }, '暂无物料'));
     table.appendChild(tr);
   }
 
@@ -906,6 +961,9 @@ async function renderMaterialsTable(panel, cat) {
     const editTd = mk('td', { class: 'muted col-attr', style: 'font-size:12px;' },
       fmtTime(m.updatedAt || m.createdAt));
     tr.appendChild(editTd);
+
+    const byTd = mk('td', { class: 'muted col-attr', style: 'font-size:12px;' }, m.updatedBy || '—');
+    tr.appendChild(byTd);
 
     const opsTd = mk('td', { class: 'col-ops' });
     const editBtn = mk('button', { class: 'link-btn' }, '编辑');
@@ -940,12 +998,12 @@ async function renderMaterialsTable(panel, cat) {
   }
 }
 
-// 位置：云端=淡绿圆点（与云端一致），本地=灰圆点（有未提交的本地改动）
+// 保存状态：已保存=与仓库一致，未保存=还有未提交的本地改动
 function buildLocationCell(m) {
-  const isCloud = !draftOf('material', m.id);
-  const span = mk('span', { class: 'loc', title: isCloud ? '与云端一致' : '有未提交的本地改动' });
-  span.appendChild(mk('i', { class: `dot ${isCloud ? 'cloud' : 'local'}` }));
-  span.appendChild(document.createTextNode(LOCATION[isCloud ? 'cloud' : 'local']));
+  const isSaved = !draftOf('material', m.id);
+  const span = mk('span', { class: 'loc', title: isSaved ? '已提交到数据仓库' : '有未提交的本地改动' });
+  span.appendChild(mk('i', { class: `dot ${isSaved ? 'cloud' : 'local'}` }));
+  span.appendChild(document.createTextNode(isSaved ? '已保存' : '未保存'));
   return span;
 }
 
@@ -1000,12 +1058,18 @@ function openMaterialDialog(mat) {
   body.appendChild(mk('div', { class: 'muted', style: 'margin-top:6px;font-size:12px;' },
     '物料编码按「年月日 + 四位流水号」自动生成'));
 
-  // 位置信息（只读）：有未提交草稿=本地，与云端一致=云端
+  // 保存状态（只读）：有未提交草稿=未保存，与仓库一致=已保存
   const locLine = mk('div', { class: 'muted', style: 'margin-top:12px;font-size:12px;' });
   const locKey = (isNew || draftOf('material', current.id)) ? 'local' : 'cloud';
-  locLine.textContent = `物料位置：${LOCATION[locKey]}` +
-    (locKey === 'cloud' && current.syncedAt ? `　最近同步：${fmtTime(current.syncedAt)}` : '　（提交后自动标记为云端）');
+  locLine.textContent = `保存状态：${locKey === 'cloud' ? '已保存' : '未保存'}` +
+    (locKey === 'cloud' && current.syncedAt ? `　最近同步：${fmtTime(current.syncedAt)}` : '　（提交后变为已保存）');
   body.appendChild(locLine);
+
+  if (!isNew) {
+    body.appendChild(mk('div', { class: 'muted', style: 'margin-top:6px;font-size:12px;' },
+      `创建：${current.createdBy || '—'}　${fmtTime(current.createdAt)}　` +
+      `最近编辑：${current.updatedBy || '—'}　${fmtTime(current.updatedAt)}`));
+  }
 
   openModal({
     title: isNew ? '新增物料' : '编辑物料',
@@ -2516,8 +2580,9 @@ async function doCommit(selectedIds, message, btn, includeInit) {
   btn.textContent = '提交中…';
 
   try {
+    progressStart('整理提交内容…');
     const { textChanges, treeDeletes } = await buildCommitPayload(draftsToSubmit, includeInit);
-    if (!textChanges.length) { toastErr('内容与远端一致，无需提交'); btn.disabled = false; btn.textContent = oldText; return; }
+    if (!textChanges.length) { toastErr('内容与远端一致，无需提交'); btn.disabled = false; btn.textContent = oldText; progressEnd(); return; }
 
     const fallback = draftsToSubmit.length
       ? `chore: Craft 系统提交（${draftsToSubmit.length} 项）`
@@ -2527,6 +2592,7 @@ async function doCommit(selectedIds, message, btn, includeInit) {
       baseCommit: state.remoteHead,
       treeChanges: textChanges,
       treeDeletes,
+      onProgress: (done, total, label) => progressSet(done, total, label),
     });
 
     // 清掉已提交的草稿
@@ -2547,6 +2613,7 @@ async function doCommit(selectedIds, message, btn, includeInit) {
       await loadDrafts();
       render();
     } else {
+      progressEnd();
       toastErr('提交失败：' + (e.message || e));
       console.error(e);
     }
@@ -2559,4 +2626,50 @@ function setLoading() {
   content.className = 'content';
   content.innerHTML = '';
   content.appendChild(mk('div', { class: 'loading' }, '加载中…'));
+}
+
+// ---------- 顶部进度条 ----------
+let progressTotal = 0;
+let progressDone = 0;
+
+function progressEls() {
+  return {
+    wrap: document.getElementById('appProgress'),
+    fill: document.getElementById('appProgressFill'),
+    text: document.getElementById('appProgressText'),
+  };
+}
+
+function progressStart(label) {
+  const { wrap, fill, text } = progressEls();
+  if (!wrap) return;
+  progressTotal = 0;
+  progressDone = 0;
+  wrap.hidden = false;
+  wrap.classList.add('indeterminate');
+  fill.style.width = '';
+  text.textContent = label || '';
+}
+
+function progressSet(done, total, label) {
+  const { wrap, fill, text } = progressEls();
+  if (!wrap) return;
+  progressDone = done;
+  progressTotal = total;
+  wrap.hidden = false;
+  wrap.classList.remove('indeterminate');
+  fill.style.width = `${total ? Math.min(100, (done / total) * 100) : 0}%`;
+  if (label) text.textContent = total ? `${label} ${done}/${total}` : label;
+}
+
+function progressAdvance(label) {
+  if (!progressTotal) return;
+  progressSet(Math.min(progressDone + 1, progressTotal), progressTotal, label);
+}
+
+function progressEnd() {
+  const { wrap } = progressEls();
+  if (!wrap) return;
+  wrap.hidden = true;
+  wrap.classList.remove('indeterminate');
 }

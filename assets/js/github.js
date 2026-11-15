@@ -143,23 +143,68 @@ export async function getRawBinary(path) {
  *   如果 baseCommit 与自动取到的 HEAD 不一致，说明远端别人提交过，直接 reject。
  *   调用方据此提示用户「请刷新后重试」。
  */
-export async function singleCommit({ message, baseCommit, treeChanges, treeDeletes = [] }) {
+export async function singleCommit({ message, baseCommit, treeChanges, treeDeletes = [], onProgress }) {
   const { owner, repo, branch, token } = getRepoSettings();
   if (!token) throw new Error('登录已失效，请重新登录');
 
+  // 进度：N 个文件 + 建目录 + 建提交 + 更新分支
+  const totalSteps = treeChanges.length + 3;
+  let doneSteps = 0;
+  const report = (label) => {
+    doneSteps += 1;
+    onProgress?.(doneSteps, totalSteps, label);
+  };
+
   // 1. 拿到当前 HEAD，做冲突比对
-  const currentHead = await getBranchHead(branch);
-  if (baseCommit && baseCommit !== currentHead) {
+  //    空仓库还没有任何 ref，GitHub 对 refs / blobs 都返回 409；
+  //    空仓库不能直接建 blob，必须先用 Contents API 写入第一个文件，产生首个提交。
+  let currentHead = null;
+  try {
+    currentHead = await getBranchHead(branch);
+  } catch (e) {
+    if (e.status !== 409) throw e;
+  }
+  if (currentHead && baseCommit && baseCommit !== currentHead) {
     const err = new Error('远端已更新，请刷新后重试');
     err.code = 'CONFLICT';
     err.remoteHead = currentHead;
     throw err;
   }
+
+  let changes = treeChanges;
+
+  if (!currentHead) {
+    const idx = changes.findIndex(c => !c.sha && typeof c.content === 'string');
+    if (idx === -1) throw new Error('空仓库首次提交需要至少一个文本文件');
+    const first = changes[idx];
+
+    const put = await ghFetch(
+      `${CONFIG.apiBase}/repos/${owner}/${repo}/contents/${first.path.split('/').map(encodeURIComponent).join('/')}`,
+      { method: 'PUT', body: JSON.stringify({ message, content: toBase64(first.content) }) }
+    );
+    currentHead = put.commit.sha;
+
+    // 首个提交落在默认分支；如果用户选的是其他分支，把该分支指到同一个提交
+    const info = await getRepo(owner, repo);
+    if (branch !== (info.default_branch || branch)) {
+      await ghFetch(
+        `${CONFIG.apiBase}/repos/${owner}/${repo}/git/refs`,
+        { method: 'POST', body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: currentHead }) }
+      );
+    }
+
+    changes = changes.filter((_, i) => i !== idx);
+    if (!changes.length) {
+      onProgress?.(1, 1, '创建首个文件');
+      return { commitSha: currentHead, treeSha: put.commit.tree?.sha || null };
+    }
+    report('创建首个文件');
+  }
+
   const base = await getCommit(currentHead);
 
-  // 2. 先创建所有 blob（文本内容直接提交）
-  const createdBlobs = [];
-  for (const change of treeChanges) {
+  // 2. 并行创建所有 blob（文本内容直接提交）
+  const createdBlobs = await Promise.all(changes.map(async (change) => {
     // 如果 change 已经带 sha（二进制附件），直接用；否则把文本转 base64 再建 blob
     let sha = change.sha;
     if (!sha) {
@@ -170,8 +215,9 @@ export async function singleCommit({ message, baseCommit, treeChanges, treeDelet
       );
       sha = blob.sha;
     }
-    createdBlobs.push({ path: change.path, sha, mode: change.mode || '100644', type: 'blob' });
-  }
+    report(`写入 ${change.path.split('/').pop()}`);
+    return { path: change.path, sha, mode: change.mode || '100644', type: 'blob' };
+  }));
 
   // 3. 构建新 tree —— 基于 base.tree.sha，用 tree API 的 base_tree 参数让它做增量
   // 对删除的路径：先拿完整 tree，过滤掉要删的 path，再把新增/修改条目覆盖进去
@@ -182,8 +228,8 @@ export async function singleCommit({ message, baseCommit, treeChanges, treeDelet
     // 只保留 blob，跳过 submodule/commit；删除集合命中的去掉
     if (item.type !== 'blob') return false;
     if (deleteSet.has(item.path)) return false;
-    // 如果这个路径在 treeChanges 里，会被新条目覆盖，这里先删掉旧的
-    if (treeChanges.some(c => c.path === item.path)) return false;
+    // 如果这个路径在本次改动里，会被新条目覆盖，这里先删掉旧的
+    if (changes.some(c => c.path === item.path)) return false;
     return true;
   });
 
@@ -193,6 +239,7 @@ export async function singleCommit({ message, baseCommit, treeChanges, treeDelet
     `${CONFIG.apiBase}/repos/${owner}/${repo}/git/trees`,
     { method: 'POST', body: JSON.stringify({ base_tree: base.tree.sha, tree: newTreeEntries }) }
   );
+  report('生成目录');
 
   // 4. 创建 commit
   const newCommit = await ghFetch(
@@ -203,12 +250,14 @@ export async function singleCommit({ message, baseCommit, treeChanges, treeDelet
         parents: [currentHead],
       }) }
   );
+  report('创建提交');
 
-  // 5. 更新 ref
+  // 5. 更新 ref（空仓库的首个提交已让分支存在）
   await ghFetch(
     `${CONFIG.apiBase}/repos/${owner}/${repo}/git/refs/heads/${branch}`,
     { method: 'PATCH', body: JSON.stringify({ sha: newCommit.sha, force: false }) }
   );
+  report('更新分支');
 
   return { commitSha: newCommit.sha, treeSha: newTree.sha };
 }

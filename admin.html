@@ -7,6 +7,10 @@
   <link rel="stylesheet" href="assets/css/admin.css" />
 </head>
 <body>
+  <div class="app-progress" id="appProgress" hidden>
+    <div class="app-progress-fill" id="appProgressFill"></div>
+    <div class="app-progress-text" id="appProgressText"></div>
+  </div>
   <div class="layout">
     <!-- 左侧导航 -->
     <aside class="sidebar">
@@ -16,6 +20,7 @@
         <a href="javascript:;" class="nav-item nav-parent" data-view="settings">系统设置<span class="nav-caret">▸</span></a>
         <a href="javascript:;" class="nav-item nav-sub" data-view="settings" data-sub="dict">字典设置</a>
         <a href="javascript:;" class="nav-item nav-sub" data-view="settings" data-sub="set">属性集合</a>
+        <a href="javascript:;" class="nav-item nav-sub" data-view="commit">提交管理<span class="nav-badge" id="commitCount" hidden></span></a>
         <a href="icons.html" class="nav-item" target="_blank" rel="noopener">图标库（临时）</a>
         <a href="index.html" class="nav-item">返回官网</a>
       </nav>
@@ -31,8 +36,15 @@
             <input id="globalMaterialSearch" type="search" placeholder="全局搜索：物料编码 / 名称" autocomplete="off" />
             <div class="global-search-results" id="globalMaterialSearchResults"></div>
           </div>
-          <button class="btn primary commit-btn" id="commitLink">提交管理(0)</button>
-          <button class="btn" id="logoutBtn" title="退出登录">退出</button>
+          <div class="account-menu">
+            <button class="avatar" id="avatarBtn" type="button"></button>
+            <div class="account-dropdown" id="accountDropdown" hidden>
+              <div class="account-name" id="accountName"></div>
+              <div class="account-repo" id="accountRepo"></div>
+              <button class="account-item" id="switchRepoBtn" type="button">切换数据仓库</button>
+              <button class="account-item danger" id="menuLogoutBtn" type="button">退出登录</button>
+            </div>
+          </div>
         </div>
       </header>
       <section class="content" id="content"></section>
