@@ -7,7 +7,11 @@ export const CONFIG = {
 
   // 仓库内数据文件路径
   categoriesPath: 'data/categories.json',
-  materialsPath: 'data/materials.json',
+  materialsRoot: 'data/materials',
+  materialsManifestPath: 'data/materials/manifest.json',
+  materialsSearchIndexPath: 'data/materials/search-index.json',
+  legacyMaterialsPath: 'data/materials.json',
+  materialChunkSize: 500,
   dictionariesPath: 'data/dictionaries.json',
   attrSetsPath: 'data/attrSets.json',
 

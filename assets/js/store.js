@@ -68,6 +68,18 @@ export async function putDraft(draft) {
   const s = await tx('drafts', 'readwrite');
   return reqToPromise(s.put(draft));
 }
+export async function putDrafts(drafts) {
+  if (!drafts.length) return;
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction('drafts', 'readwrite');
+    const store = transaction.objectStore('drafts');
+    for (const draft of drafts) store.put(draft);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error);
+  });
+}
 export async function removeDraft(tableId, recordId) {
   const s = await tx('drafts', 'readwrite');
   return reqToPromise(s.delete(`${tableId}:${recordId}`));

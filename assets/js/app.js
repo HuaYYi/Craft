@@ -4,9 +4,10 @@
 //   categories.json : [{ id, name, parentId, isLeaf, sort, desc,
 //                        attrs:[{key,label,type,options,required}],   // 字段定义：非末级=给下级继承；末级=物料属性
 //                        attrValues:{ key: 值 } }]                    // 继承字段在本组的值（整组一份，不进物料档案）
-//   materials.json  : [{ id, categoryId, code, name,
+//   materials/      : manifest + 轻量搜索索引 + 分类索引 + 完整物料分片
+//   完整物料字段    : { id, categoryId, code, name,
 //                        attrs:{ key: 值 },                          // 末级分组定义的字段值，每个物料各自一份
-//                        location, syncedAt, createdAt, updatedAt, createdBy, updatedBy }]
+//                        location, syncedAt, createdAt, updatedAt, createdBy, updatedBy }
 //
 // 改动统一先进 IndexedDB 草稿（drafts），点右上角「提交管理」勾选后一次 commit 推送。
 //
@@ -17,6 +18,7 @@ import * as Store from './store.js';
 import * as GH from './github.js';
 import * as Cat from './categories.js';
 import * as Excel from './excel.js';
+import * as MaterialStore from './material-store.js';
 import { renderForm, renderAttrDefTable, mk } from './fields.js';
 import { openModal, closeModal, toastOk, toastErr, confirm, toast } from './ui.js';
 
@@ -29,7 +31,6 @@ const state = {
   baseDictionaries: [],
   baseAttrSets: [],
   rawCategoriesText: '',
-  rawMaterialsText: '',
   rawDictionariesText: '',
   rawAttrSetsText: '',
   // 应用草稿后的展示数据
@@ -47,6 +48,9 @@ const state = {
   expanded: new Set(),
   checked: new Set(),
   search: '',
+  materialPage: 1,
+  materialPageSize: 50,
+  materialViewSeq: 0,
   dictChecked: new Set(),     // 字典设置页勾选
   setChecked: new Set(),      // 属性集合页勾选
   draggingCatId: null,        // 正在拖拽的分组 id
@@ -77,10 +81,9 @@ function nextMaterialCode() {
 const clone = (v) => JSON.parse(JSON.stringify(v));
 const UNGROUPED = '';          // 未分组的 categoryId
 
-// 四份数据文件，统一按「草稿 → 提交」处理
+// 配置数据整文件处理；物料由 MaterialStore 按分类分片处理
 const DATA_SETS = [
   { kind: 'category',   path: CONFIG.categoriesPath,   base: 'baseCategories',   live: 'categories',   raw: 'rawCategoriesText' },
-  { kind: 'material',   path: CONFIG.materialsPath,    base: 'baseMaterials',    live: 'materials',    raw: 'rawMaterialsText' },
   { kind: 'dictionary', path: CONFIG.dictionariesPath, base: 'baseDictionaries', live: 'dictionaries', raw: 'rawDictionariesText' },
   { kind: 'attrSet',    path: CONFIG.attrSetsPath,     base: 'baseAttrSets',     live: 'attrSets',     raw: 'rawAttrSetsText' },
 ];
@@ -105,6 +108,7 @@ async function init() {
 
   state.settings = GH.getGithubSettings();
   bindNav();
+  bindGlobalMaterialSearch();
   bindInfoTips();
   await refreshRemote();
 
@@ -131,6 +135,67 @@ function bindNav() {
   document.getElementById('commitLink').addEventListener('click', () => switchView('commit'));
   const saved = localStorage.getItem('craft.navOpen');
   toggleNavGroup(saved === '1');
+}
+
+function bindGlobalMaterialSearch() {
+  const input = document.getElementById('globalMaterialSearch');
+  const resultsEl = document.getElementById('globalMaterialSearchResults');
+  let matches = [];
+  let timer = null;
+
+  const close = () => resultsEl.classList.remove('open');
+  const locate = (material) => {
+    state.selectedCategoryId = material.categoryId || UNGROUPED;
+    state.activeTab = 'materials';
+    state.search = material.code || material.name || '';
+    state.materialPage = 1;
+    state.checked.clear();
+    close();
+    input.value = '';
+    switchView('materials');
+  };
+  const paint = () => {
+    const keyword = input.value.trim().toLowerCase();
+    resultsEl.innerHTML = '';
+    matches = [];
+    if (!keyword) { close(); return; }
+    matches = state.materials.filter(m =>
+      String(m.code || '').toLowerCase().includes(keyword) ||
+      String(m.name || '').toLowerCase().includes(keyword)
+    ).sort((a, b) => String(a.code || '').localeCompare(String(b.code || ''), 'zh', { numeric: true }));
+    resultsEl.classList.add('open');
+    if (!matches.length) {
+      resultsEl.appendChild(mk('div', { class: 'global-search-empty' }, '没有匹配的物料'));
+      return;
+    }
+    for (const material of matches.slice(0, 50)) {
+      const row = mk('div', { class: 'global-search-item' });
+      const line = mk('div');
+      line.appendChild(mk('span', { class: 'global-search-code' }, material.code || material.id));
+      line.appendChild(mk('span', { class: 'global-search-name' }, material.name || ''));
+      row.appendChild(line);
+      const category = material.categoryId
+        ? Cat.categoryPathString(state.categories, material.categoryId)
+        : '未分组';
+      row.appendChild(mk('div', { class: 'global-search-cat' }, category || '未分组'));
+      row.addEventListener('mousedown', e => { e.preventDefault(); locate(material); });
+      resultsEl.appendChild(row);
+    }
+    if (matches.length > 50) {
+      resultsEl.appendChild(mk('div', { class: 'global-search-more' }, `共 ${matches.length} 条匹配，仅显示前 50 条，请继续缩小范围`));
+    }
+  };
+
+  input.addEventListener('input', () => {
+    clearTimeout(timer);
+    timer = setTimeout(paint, 150);
+  });
+  input.addEventListener('focus', paint);
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && matches.length) { e.preventDefault(); locate(matches[0]); }
+    else if (e.key === 'Escape') { close(); input.blur(); }
+  });
+  input.addEventListener('blur', () => setTimeout(close, 100));
 }
 
 // 二级导航展开/收起（状态持久化到 localStorage）
@@ -195,6 +260,8 @@ async function refreshRemote() {
       state[s.base] = texts[s.kind] ? safeParse(texts[s.kind], []) : [];
       state[s.raw] = texts[s.kind] || '[]';
     }
+    const materialData = await MaterialStore.loadRemote(!!state.pat);
+    state.baseMaterials = materialData.materials;
   } catch (e) {
     console.warn('远端读取失败', e);
     toastErr('远端同步失败：' + (e.message || e));
@@ -215,8 +282,27 @@ async function loadDrafts() {
 function applyDrafts() {
   const sets = {};
   for (const s of DATA_SETS) sets[s.kind] = clone(state[s.base]);
+  const materials = clone(state.baseMaterials);
 
   for (const d of state.drafts) {
+    if (d.kind === 'material') {
+      const idx = materials.findIndex(x => x.id === d.recordId);
+      if (d.op === 'delete') {
+        if (idx >= 0) materials.splice(idx, 1);
+        continue;
+      }
+      const previous = idx >= 0 ? materials[idx] : null;
+      const summary = {
+        id: d.data.id,
+        categoryId: d.data.categoryId || '',
+        code: d.data.code || '',
+        name: d.data.name || '',
+        path: previous?.path || '',
+      };
+      if (idx >= 0) materials[idx] = summary;
+      else materials.push(summary);
+      continue;
+    }
     const target = sets[d.kind];
     if (!target) continue;
     const idx = target.findIndex(x => x.id === d.recordId);
@@ -231,6 +317,7 @@ function applyDrafts() {
   }
 
   for (const s of DATA_SETS) state[s.live] = sets[s.kind];
+  state.materials = materials;
 
   // 选中分组若被删掉则回退到未分组
   if (state.selectedCategoryId !== UNGROUPED && !state.categories.some(c => c.id === state.selectedCategoryId)) {
@@ -291,6 +378,28 @@ function draftOf(kind, id) {
   return state.drafts.find(d => d.kind === kind && d.recordId === id) || null;
 }
 
+async function hydrateMaterials(entries) {
+  const remoteEntries = entries.filter(entry => {
+    const draft = draftOf('material', entry.id);
+    return !draft || draft.op === 'delete';
+  });
+  const remote = await MaterialStore.hydrate(remoteEntries);
+  const byId = new Map(remote.map(item => [item.id, item]));
+  return entries.map(entry => {
+    const draft = draftOf('material', entry.id);
+    if (draft && draft.op !== 'delete') return clone(draft.data);
+    const record = byId.get(entry.id);
+    if (!record) throw new Error(`物料 ${entry.code || entry.id} 加载失败`);
+    return record;
+  });
+}
+
+async function getMaterialById(id) {
+  const summary = state.materials.find(item => item.id === id);
+  if (!summary) return null;
+  return (await hydrateMaterials([summary]))[0];
+}
+
 // ---------- 物料及分组页 ----------
 function renderMaterialsPage() {
   const content = document.getElementById('content');
@@ -325,7 +434,7 @@ function buildTreePanel() {
     count: ungroupedCount,
     active: state.selectedCategoryId === UNGROUPED,
     isRoot: true,
-    onClick: () => { state.selectedCategoryId = UNGROUPED; state.activeTab = 'materials'; state.checked.clear(); render(); },
+    onClick: () => { state.selectedCategoryId = UNGROUPED; state.activeTab = 'materials'; state.materialPage = 1; state.checked.clear(); render(); },
   }));
 
   const roots = Cat.buildTree(state.categories);
@@ -354,6 +463,7 @@ function buildTreePanel() {
         onClick: () => {
           state.selectedCategoryId = node.id;
           state.activeTab = node.isLeaf ? 'materials' : 'manage';
+          state.materialPage = 1;
           state.checked.clear();
           if (hasKids) state.expanded.add(node.id);
           render();
@@ -540,57 +650,74 @@ function buildCatMain() {
 }
 
 // ---------- 物料档案 ----------
-function currentMaterials() {
-  let list = state.materials;
-  if (state.selectedCategoryId === UNGROUPED) {
-    // 未分组：没有 categoryId，或指向的分组已不存在
-    list = list.filter(m => !m.categoryId || !state.categories.some(c => c.id === m.categoryId));
-  } else {
-    const ids = Cat.selfAndDescendantIds(state.categories, state.selectedCategoryId);
-    list = list.filter(m => ids.has(m.categoryId));
+async function currentMaterialSummaries() {
+  const categoryId = state.selectedCategoryId || UNGROUPED;
+  const records = await MaterialStore.listCategory(categoryId);
+  const byId = new Map(records.map(item => [item.id, item]));
+
+  // 分类索引只包含云端数据，本地新增、修改、删除和跨组移动在这里叠加。
+  for (const draft of state.drafts) {
+    if (draft.kind !== 'material') continue;
+    const base = state.baseMaterials.find(item => item.id === draft.recordId);
+    if (base && (base.categoryId || '') === categoryId) byId.delete(base.id);
+    if (draft.op !== 'delete' && (draft.data.categoryId || '') === categoryId) {
+      byId.set(draft.recordId, {
+        id: draft.recordId,
+        categoryId,
+        code: draft.data.code || '',
+        name: draft.data.name || '',
+        path: base?.path || '',
+      });
+    }
   }
-  const kw = state.search.trim().toLowerCase();
-  if (kw) {
+
+  const keyword = state.search.trim().toLowerCase();
+  let list = Array.from(byId.values());
+  if (keyword) {
     list = list.filter(m =>
-      (m.code || '').toLowerCase().includes(kw) ||
-      (m.name || '').toLowerCase().includes(kw));
+      String(m.code || '').toLowerCase().includes(keyword) ||
+      String(m.name || '').toLowerCase().includes(keyword));
   }
-  // 按物料编码自然排序：草稿是按键名（内部 ID）取回的，顺序本身是随机的，
-  // 不显式排序会导致列表/导出顺序错乱
-  list = [...list].sort((a, b) =>
+  return list.sort((a, b) =>
     String(a.code || '').localeCompare(String(b.code || ''), 'zh', { numeric: true }));
-  return list;
+}
+
+async function currentMaterials() {
+  const summaries = await currentMaterialSummaries();
+  return hydrateMaterials(summaries);
 }
 
 function buildMaterialsPanel(cat) {
   const panel = mk('div', { class: 'tab-panel' });
 
-  // 工具栏：只留搜索和计数，操作都移到右侧图标栏
   const bar = mk('div', { class: 'toolbar' });
-  const search = mk('input', { type: 'search', placeholder: '搜索物料编码 / 名称' });
+  const search = mk('input', { type: 'search', placeholder: '搜索当前分类：物料编码 / 名称' });
   search.value = state.search;
+  let searchTimer = null;
   search.addEventListener('input', e => {
     state.search = e.target.value;
-    refreshMaterialsTable(panel, cat);
+    state.materialPage = 1;
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => refreshMaterialsTable(panel, cat), 150);
   });
   bar.appendChild(search);
 
-  const info = mk('span', { class: 'hint' });
+  const info = mk('span', { class: 'hint materials-count' });
   bar.appendChild(info);
   bar.appendChild(mk('span', { class: 'spacer' }));
   if (state.checked.size) {
     bar.appendChild(mk('span', { class: 'hint' }, `已选 ${state.checked.size} 项`));
   }
-
+  const pagination = mk('div', { class: 'materials-pagination', id: 'materialsPagination' });
+  bar.appendChild(pagination);
   panel.appendChild(bar);
 
-  // 表格区域（图标工具栏在 renderMaterialsPage 里作为页面第三列）
   const body = mk('div', { class: 'materials-body' });
   const tableWrap = mk('div', { class: 'table-wrap', id: 'materialsTableWrap' });
   body.appendChild(tableWrap);
   panel.appendChild(body);
 
-  renderMaterialsTable(tableWrap, cat, info);
+  refreshMaterialsTable(panel, cat);
   return panel;
 }
 
@@ -632,20 +759,64 @@ function buildSideRail() {
 }
 
 function refreshMaterialsTable(panel, cat) {
-  const wrap = panel.querySelector('#materialsTableWrap');
-  const info = panel.querySelector('.hint');
-  if (!wrap) return;
-  renderMaterialsTable(wrap, cat, info);
+  renderMaterialsTable(panel, cat).catch(e => {
+    console.error(e);
+    if (panel.isConnected) toastErr('物料加载失败：' + (e.message || e));
+  });
 }
 
-function renderMaterialsTable(wrap, cat, info) {
+async function renderMaterialsTable(panel, cat) {
+  const wrap = panel.querySelector('#materialsTableWrap');
+  const info = panel.querySelector('.materials-count');
+  const pagination = panel.querySelector('#materialsPagination');
+  if (!wrap) return;
+  const seq = ++state.materialViewSeq;
   wrap.innerHTML = '';
-  const list = currentMaterials();
-  if (info) info.textContent = `共 ${list.length} 条`;
+  wrap.appendChild(mk('div', { class: 'empty', style: 'padding:24px;' }, '加载中…'));
+  if (pagination) pagination.innerHTML = '';
+
+  let summaries;
+  let list;
+  let totalPages;
+  try {
+    summaries = await currentMaterialSummaries();
+    if (seq !== state.materialViewSeq) return;
+    totalPages = Math.max(1, Math.ceil(summaries.length / state.materialPageSize));
+    state.materialPage = Math.min(Math.max(1, state.materialPage), totalPages);
+    const start = (state.materialPage - 1) * state.materialPageSize;
+    list = await hydrateMaterials(summaries.slice(start, start + state.materialPageSize));
+  } catch (e) {
+    if (seq === state.materialViewSeq) {
+      wrap.innerHTML = '';
+      wrap.appendChild(mk('div', { class: 'empty', style: 'padding:24px;' }, '加载失败：' + (e.message || e)));
+    }
+    throw e;
+  }
+  if (seq !== state.materialViewSeq || !panel.isConnected) return;
+
+  wrap.innerHTML = '';
+  if (info) info.textContent = `共 ${summaries.length} 条，每页 ${state.materialPageSize} 条`;
+  if (pagination) {
+    const prev = mk('button', { class: 'btn small' }, '上一页');
+    prev.disabled = state.materialPage <= 1;
+    prev.addEventListener('click', () => {
+      state.materialPage--;
+      refreshMaterialsTable(panel, cat);
+    });
+    const next = mk('button', { class: 'btn small' }, '下一页');
+    next.disabled = state.materialPage >= totalPages;
+    next.addEventListener('click', () => {
+      state.materialPage++;
+      refreshMaterialsTable(panel, cat);
+    });
+    pagination.appendChild(prev);
+    pagination.appendChild(mk('span', { class: 'page-info' }, `第 ${state.materialPage} / ${totalPages} 页`));
+    pagination.appendChild(next);
+  }
 
   const table = mk('table', { class: 'grid' });
   const head = mk('tr');
-  const chkAll = mk('input', { type: 'checkbox' });
+  const chkAll = mk('input', { type: 'checkbox', title: '全选本页' });
   const allVisibleChecked = list.length > 0 && list.every(m => state.checked.has(m.id));
   chkAll.checked = allVisibleChecked;
   chkAll.addEventListener('change', () => {
@@ -654,10 +825,10 @@ function renderMaterialsTable(wrap, cat, info) {
     render();
   });
 
-  // 物料属性列：当前可见物料所属末级分组生效字段的并集，每个属性单独一列
+  // 属性列覆盖当前筛选结果，完整属性值仍只加载当前页。
   const attrDefs = [];
   const seenKeys = new Set();
-  for (const m of list) {
+  for (const m of summaries) {
     if (!m.categoryId) continue;
     const cat = Cat.findCategory(state.categories, m.categoryId);
     for (const def of fieldsOf(attrsOf(cat))) {
@@ -870,7 +1041,7 @@ async function doDeleteMaterial(m) {
 async function doCopyMaterial() {
   const ids = Array.from(state.checked);
   if (ids.length !== 1) { toastErr('请先勾选 1 条物料再复制'); return; }
-  const src = state.materials.find(m => m.id === ids[0]);
+  const src = await getMaterialById(ids[0]);
   if (!src) { toastErr('物料不存在'); return; }
 
   const mat = {
@@ -1025,7 +1196,7 @@ function openBatchMoveDialog() {
         onClick: async () => {
           const target = picker.value;
           for (const id of ids) {
-            const m = state.materials.find(x => x.id === id);
+            const m = await getMaterialById(id);
             if (!m) continue;
             const d = draftOf('material', id);
             const op = d?.op === 'add' ? 'add' : 'update';
@@ -1045,7 +1216,7 @@ async function doBatchDelete() {
   if (!ids.length) { toastErr('请先勾选物料'); return; }
   if (!(await confirm(`确定删除选中的 ${ids.length} 条物料？`))) return;
   for (const id of ids) {
-    const m = state.materials.find(x => x.id === id);
+    const m = await getMaterialById(id);
     if (!m) continue;
     const d = draftOf('material', id);
     if (d?.op === 'add') await Store.removeDraft('material', id);
@@ -1058,10 +1229,10 @@ async function doBatchDelete() {
 }
 
 // ---------- Excel 导入导出 ----------
-function doExport() {
-  const list = currentMaterials();
-  if (!list.length) { toastErr('当前没有可导出的物料'); return; }
+async function doExport() {
   try {
+    const list = await currentMaterials();
+    if (!list.length) { toastErr('当前没有可导出的物料'); return; }
     // 物料位置按同步状态推导：有未提交草稿=本地
     const rows = list.map(m => ({ ...m, location: draftOf('material', m.id) ? 'local' : 'cloud' }));
     const n = Excel.exportMaterials(rows, state.categories, state.attrSets, state.dictionaries);
@@ -1080,7 +1251,7 @@ function triggerImport() {
     const file = input.files[0];
     try {
       const rows = await Excel.parseMaterialsFile(file);
-      openImportPreview(rows, file.name);
+      await openImportPreview(rows, file.name);
     } catch (e) {
       toastErr('读取失败：' + (e.message || e));
     }
@@ -1088,7 +1259,7 @@ function triggerImport() {
   input.click();
 }
 
-function openImportPreview(rows, fileName) {
+async function openImportPreview(rows, fileName) {
   if (!rows.length) { toastErr('文件里没有数据行'); return; }
 
   // 在副本上预演，避免改动真实数据
@@ -1105,9 +1276,10 @@ function openImportPreview(rows, fileName) {
       for (const c of r.created) plan.createdCats.push(c);
     }
 
-    const existing = (row.id && state.materials.find(m => m.id === row.id))
+    const existingSummary = (row.id && state.materials.find(m => m.id === row.id))
       || (row.code && state.materials.find(m => m.code === row.code))
       || null;
+    const existing = existingSummary ? await getMaterialById(existingSummary.id) : null;
 
     const targetCatId = categoryId;
 
@@ -1155,16 +1327,21 @@ function openImportPreview(rows, fileName) {
       {
         label: '写入草稿', className: 'primary',
         onClick: async () => {
-          // 新建的分组
+          const drafts = [];
+          const addDraft = (kind, data, op) => drafts.push({
+            id: `${kind}:${data.id}`, kind, recordId: data.id, op, data: clone(data),
+          });
           for (const c of plan.createdCats) {
             const existingDraft = draftOf('category', c.id);
-            await saveCategoryDraft(c, existingDraft?.op === 'update' ? 'update' : 'add');
+            addDraft('category', c, existingDraft?.op === 'update' ? 'update' : 'add');
           }
           for (const u of plan.updates) {
             const d = draftOf('material', u.existing.id);
-            await saveMaterialDraft(u.data, d?.op === 'add' ? 'add' : 'update');
+            addDraft('material', u.data, d?.op === 'add' ? 'add' : 'update');
           }
-          for (const i of plan.inserts) await saveMaterialDraft(i.data, 'add');
+          for (const i of plan.inserts) addDraft('material', i.data, 'add');
+          await Store.putDrafts(drafts);
+          await loadDrafts();
 
           closeModal();
           render();
@@ -1330,8 +1507,9 @@ function buildManagePanel(cat) {
         for (const k of removedKeys) if (k in (c.attrValues || {})) valuesInCats++;
       }
       if (cat.isLeaf) {
-        for (const m of state.materials) {
-          if (m.categoryId !== cat.id) continue;
+        const summaries = state.materials.filter(m => m.categoryId === cat.id);
+        const materials = await hydrateMaterials(summaries);
+        for (const m of materials) {
           if (removedKeys.some(k => k in (m.attrs || {}))) matsAffected++;
         }
       }
@@ -1451,7 +1629,8 @@ async function doDeleteCategory(cat) {
 async function doCopyCategory(cat) {
   const ids = Cat.selfAndDescendantIds(state.categories, cat.id);
   const subCount = ids.size - 1;
-  const matsInTree = state.materials.filter(m => m.categoryId && ids.has(m.categoryId));
+  const matsInTree = await hydrateMaterials(
+    state.materials.filter(m => m.categoryId && ids.has(m.categoryId)));
 
   // 目标父级：根级 + 所有非末级分组（排除自身及后代，避免把树拷进自己里面）
   const parentOptions = [{ id: null, label: '（根级）' }];
@@ -1584,8 +1763,8 @@ async function cleanFieldValues(cat, removedKeys) {
   }
   // 只有末级分组的字段值存在物料上
   if (!cat.isLeaf) return;
-  for (const m of state.materials) {
-    if (m.categoryId !== cat.id) continue;
+  const materials = await hydrateMaterials(state.materials.filter(m => m.categoryId === cat.id));
+  for (const m of materials) {
     const hit = removedKeys.filter(k => k in (m.attrs || {}));
     if (!hit.length) continue;
     const next = { ...m, attrs: { ...m.attrs }, updatedAt: nowISO() };
@@ -2278,7 +2457,7 @@ async function discardAllDrafts() {
 }
 
 // ---------- 提交 ----------
-function buildCommitPayload(selectedDrafts) {
+async function buildCommitPayload(selectedDrafts) {
   const now = nowISO();
   const sets = {};
   for (const s of DATA_SETS) sets[s.kind] = clone(state[s.base]);
@@ -2292,10 +2471,6 @@ function buildCommitPayload(selectedDrafts) {
       continue;
     }
     const next = clone(d.data);
-    if (d.kind === 'material') {
-      next.location = 'cloud';
-      next.syncedAt = now;
-    }
     if (idx >= 0) target[idx] = next; else target.push(next);
   }
 
@@ -2304,8 +2479,11 @@ function buildCommitPayload(selectedDrafts) {
     const text = JSON.stringify(sets[s.kind], null, 2) + '\n';
     if (text !== state[s.raw]) textChanges.push({ path: s.path, content: text });
   }
-
-  return { textChanges };
+  const materialPayload = await MaterialStore.buildCommitPayload(selectedDrafts, now);
+  return {
+    textChanges: textChanges.concat(materialPayload.textChanges),
+    treeDeletes: materialPayload.treeDeletes,
+  };
 }
 
 async function doCommit(selectedIds, message, btn) {
@@ -2316,14 +2494,14 @@ async function doCommit(selectedIds, message, btn) {
 
   try {
     GH.setToken(state.pat);
-    const { textChanges } = buildCommitPayload(draftsToSubmit);
+    const { textChanges, treeDeletes } = await buildCommitPayload(draftsToSubmit);
     if (!textChanges.length) { toastErr('内容与远端一致，无需提交'); btn.disabled = false; btn.textContent = oldText; return; }
 
     const result = await GH.singleCommit({
-      message: message || `chore: Craft 后台提交（${draftsToSubmit.length} 项）`,
+      message: message || `chore: Craft 系统提交（${draftsToSubmit.length} 项）`,
       baseCommit: state.remoteHead,
       treeChanges: textChanges,
-      treeDeletes: [],
+      treeDeletes,
     });
 
     // 清掉已提交的草稿
