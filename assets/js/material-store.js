@@ -9,6 +9,9 @@ const defaultCategory = (categoryId) => ({ categoryId: categoryId || '', seq: 0,
 let manifest = defaultManifest();
 let baseIndex = [];
 let remoteCategoryIds = new Set();
+let indexExisted = false;
+let indexGzExisted = false;
+let manifestExisted = false;
 const shardCache = new Map();
 const categoryCache = new Map();
 
@@ -24,6 +27,76 @@ function summaryOf(data, path) {
     name: data.name || '',
     path: path || data.path || '',
   };
+}
+
+// ---------- 搜索索引：紧凑结构 + gzip ----------
+// 磁盘格式：{"v":2,"cats":["c_a",...],"items":[[catIdx,page,id,code,name],...]}
+// 读取时展开成原有 { id, categoryId, code, name, path }，上层逻辑无需改动。
+const INDEX_VERSION = 2;
+
+function compactIndex(items) {
+  const cats = [];
+  const catIdx = new Map();
+  const rows = [];
+  for (const item of items) {
+    const categoryId = item.categoryId || '';
+    if (!catIdx.has(categoryId)) {
+      catIdx.set(categoryId, cats.length);
+      cats.push(categoryId);
+    }
+    const match = /page-(\d+)\.json$/.exec(item.path || '');
+    rows.push([catIdx.get(categoryId), match ? Number(match[1]) : 0, item.id || '', item.code || '', item.name || '']);
+  }
+  return { v: INDEX_VERSION, cats, items: rows };
+}
+
+function expandIndex(data) {
+  if (Array.isArray(data)) return data; // 兼容旧版完整数组
+  const cats = Array.isArray(data?.cats) ? data.cats : [];
+  return (Array.isArray(data?.items) ? data.items : []).map(row => {
+    const [catIdx, page, id, code, name] = row;
+    const categoryId = cats[catIdx] || '';
+    return {
+      id,
+      categoryId,
+      code: code || '',
+      name: name || '',
+      path: page
+        ? `${CONFIG.materialsRoot}/categories/${categoryKey(categoryId)}/page-${String(page).padStart(6, '0')}.json`
+        : '',
+    };
+  });
+}
+
+async function gzipToBase64(text) {
+  if (typeof CompressionStream === 'undefined') {
+    throw new Error('当前浏览器不支持 gzip 压缩，请升级到最新版 Chrome / Edge');
+  }
+  const stream = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'));
+  const buffer = await new Response(stream).arrayBuffer();
+  return GH.bytesToBase64(new Uint8Array(buffer));
+}
+
+async function gunzipToText(bytes) {
+  if (typeof DecompressionStream === 'undefined') {
+    throw new Error('当前浏览器不支持 gzip 解压，请升级到最新版 Chrome / Edge');
+  }
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Response(stream).text();
+}
+
+// 读全局搜索索引：优先 gz，缺失时兼容旧的 search-index.json
+export async function readSearchIndex() {
+  const file = await GH.getFileBinary(CONFIG.materialsSearchIndexPath);
+  if (file) {
+    const data = JSON.parse(await gunzipToText(file.bytes));
+    return { items: expandIndex(data), existed: true, gz: true };
+  }
+  const legacy = await GH.getFile(CONFIG.legacySearchIndexPath);
+  if (legacy) {
+    return { items: expandIndex(JSON.parse(legacy.content) || []), existed: true, gz: false };
+  }
+  return { items: [], existed: false, gz: false };
 }
 
 function categoryKey(categoryId) {
@@ -56,10 +129,11 @@ async function getShard(path) {
   return shardCache.get(path);
 }
 
-async function getCategory(categoryId) {
+async function getCategory(categoryId, force = false) {
   const key = categoryId || '';
   // 全局索引中没有该分类，说明远端还没有分类索引；本地新分类无需再请求一次 404。
-  if (!remoteCategoryIds.has(key)) return defaultCategory(key);
+  // force=true 时仍去仓库读一次，用于修复索引丢失后残留的分片。
+  if (!force && !remoteCategoryIds.has(key)) return defaultCategory(key);
   if (!categoryCache.has(key)) {
     const path = categoryIndexPath(key);
     const promise = readJson(path).then(data => ({
@@ -80,15 +154,18 @@ async function getCategory(categoryId) {
 export async function loadRemote() {
   shardCache.clear();
   categoryCache.clear();
-  const [manifestFile, searchFile] = await Promise.all([
+  const [manifestFile, search] = await Promise.all([
     GH.getFile(CONFIG.materialsManifestPath),
-    GH.getFile(CONFIG.materialsSearchIndexPath),
+    readSearchIndex(),
   ]);
   const missingPaths = [];
+  indexExisted = search.existed;
+  indexGzExisted = search.gz;
+  manifestExisted = !!manifestFile;
   if (!manifestFile) missingPaths.push(CONFIG.materialsManifestPath);
-  if (!searchFile) missingPaths.push(CONFIG.materialsSearchIndexPath);
+  if (!search.existed) missingPaths.push(CONFIG.materialsSearchIndexPath);
   manifest = { ...defaultManifest(), ...(manifestFile ? JSON.parse(manifestFile.content) : {}) };
-  baseIndex = searchFile ? (JSON.parse(searchFile.content) || []) : [];
+  baseIndex = search.items;
   remoteCategoryIds = new Set(baseIndex.map(item => item.categoryId || ''));
   return { manifest: clone(manifest), materials: clone(baseIndex), missingPaths };
 }
@@ -116,7 +193,7 @@ export async function hydrate(entries) {
 // 仅重建本次草稿影响的分类索引和分片；init=true 时额外写入首次需要的空索引。
 export async function buildCommitPayload(selectedDrafts, syncedAt, init = false) {
   const drafts = selectedDrafts.filter(d => d.kind === 'material');
-  if (!drafts.length && !init) return { textChanges: [], treeDeletes: [] };
+  if (!drafts.length && !init) return { fileChanges: [], treeDeletes: [] };
 
   const work = clone(baseIndex);
   const byId = new Map(work.map(item => [item.id, item]));
@@ -214,7 +291,7 @@ export async function buildCommitPayload(selectedDrafts, syncedAt, init = false)
   const deletes = new Set(deletedShards);
   for (const [path, records] of shardWork) {
     if (records.length && !deletedShards.has(path)) {
-      changes.set(path, JSON.stringify(records, null, 2) + '\n');
+      changes.set(path, { content: JSON.stringify(records, null, 2) + '\n' });
     }
   }
 
@@ -223,17 +300,58 @@ export async function buildCommitPayload(selectedDrafts, syncedAt, init = false)
     category.records = work.filter(item => (item.categoryId || '') === categoryId).sort(compareCode);
     const indexPath = categoryIndexPath(categoryId);
     if (!category.records.length && !category.chunks.length) deletes.add(indexPath);
-    else changes.set(indexPath, JSON.stringify(category, null, 2) + '\n');
+    else changes.set(indexPath, { content: JSON.stringify(category, null, 2) + '\n' });
   }
 
   manifest.total = work.length;
-  changes.set(CONFIG.materialsManifestPath, JSON.stringify(manifest, null, 2) + '\n');
-  changes.set(CONFIG.materialsSearchIndexPath, JSON.stringify(work, null, 2) + '\n');
+  // 初始化提交只补缺失文件，绝不能用空数组覆盖已有的索引/清单
+  if (!(init && manifestExisted)) {
+    changes.set(CONFIG.materialsManifestPath, { content: JSON.stringify(manifest, null, 2) + '\n' });
+  }
+  const writeIndex = !(init && indexExisted);
+  if (writeIndex) {
+    const compact = JSON.stringify(compactIndex(work));
+    changes.set(CONFIG.materialsSearchIndexPath, { base64: await gzipToBase64(compact) });
+  }
+  if (writeIndex || indexGzExisted) deletes.add(CONFIG.legacySearchIndexPath);
   deletes.add(CONFIG.legacyMaterialsPath);
 
   for (const path of deletes) changes.delete(path);
   return {
-    textChanges: Array.from(changes, ([path, content]) => ({ path, content })),
+    fileChanges: Array.from(changes, ([path, change]) => ({ path, ...change })),
     treeDeletes: Array.from(deletes, path => ({ path })),
+  };
+}
+
+/**
+ * 重建全局搜索索引与清单：逐个分组读取分类索引（缺失时读分片），
+ * 用于修复「分片里有物料但搜索索引为空」这类不一致。
+ */
+export async function rebuildSearchIndex(categoryIds, onProgress) {
+  const byId = new Map();
+  let done = 0;
+  for (const categoryId of categoryIds) {
+    const category = await getCategory(categoryId, true);
+    const records = (category.records || []).length
+      ? category.records
+      : (await Promise.all((category.chunks || []).map(path => getShard(path)))).flat();
+    for (const record of records) {
+      if (!record || !record.id) continue;
+      byId.set(record.id, summaryOf(record, record.path || ''));
+    }
+    done += 1;
+    if (onProgress) onProgress(done, categoryIds.length);
+  }
+  baseIndex = Array.from(byId.values()).sort(compareCode);
+  manifest = { ...manifest, total: baseIndex.length };
+  indexExisted = true;
+  indexGzExisted = true;
+  return {
+    fileChanges: [
+      { path: CONFIG.materialsSearchIndexPath, base64: await gzipToBase64(JSON.stringify(compactIndex(baseIndex))) },
+      { path: CONFIG.materialsManifestPath, content: JSON.stringify(manifest, null, 2) + '\n' },
+    ],
+    treeDeletes: [{ path: CONFIG.legacySearchIndexPath }],
+    total: baseIndex.length,
   };
 }

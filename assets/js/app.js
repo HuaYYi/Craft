@@ -47,7 +47,7 @@ const state = {
   remoteHead: null,
   missingDataFiles: [],      // 数据仓库首次初始化时需要创建的文件
   // UI 状态
-  selectedCategoryId: '',     // '' = 未分组（虚拟节点）；否则为分组 id
+  selectedCategoryId: '', // '' = 未分组（含分组异常物料）；否则为分组 id
   activeTab: 'materials',
   expanded: new Set(),
   checked: new Set(),
@@ -90,8 +90,7 @@ async function prepareDraftsWithCodes(drafts) {
       || String(a.recordId).localeCompare(String(b.recordId)));
   if (!adds.length) return drafts;
 
-  const file = await GH.getFile(CONFIG.materialsSearchIndexPath);
-  const index = file ? (JSON.parse(file.content) || []) : [];
+  const { items: index } = await MaterialStore.readSearchIndex();
   const prefix = todayPrefix();
   const used = new Set(index.map(item => String(item?.code || '')).filter(Boolean));
   let maxSeq = 0;
@@ -175,7 +174,33 @@ async function init() {
   }
 
   await loadDrafts();
+  await autoFixLooseMaterials();
   render();
+}
+
+// 分组缺失或已非末级的物料：自动生成一条「改到未分组」的草稿，提交后即恢复正常
+async function autoFixLooseMaterials() {
+  if (!state.categories.length || !state.materials.length) return;
+  const leafIds = new Set(state.categories.filter(c => c.isLeaf).map(c => c.id));
+  const bad = state.materials.filter(m =>
+    m.categoryId && !leafIds.has(m.categoryId) && !draftOf('material', m.id));
+  if (!bad.length) return;
+  try {
+    const full = await hydrateMaterials(bad);
+    const who = state.user?.name || state.user?.login || '';
+    const drafts = full.map(m => ({
+      id: `material:${m.id}`,
+      kind: 'material',
+      recordId: m.id,
+      op: 'update',
+      data: { ...m, categoryId: '', updatedAt: nowISO(), updatedBy: who || m.updatedBy || '' },
+    }));
+    await Store.putDrafts(drafts);
+    await loadDrafts();
+    toast(`已自动把 ${drafts.length} 条分组异常物料归入未分组，提交后生效`, 'warn', 4000);
+  } catch (e) {
+    console.warn('自动整理异常物料失败', e);
+  }
 }
 
 function bindAccountBar() {
@@ -228,7 +253,9 @@ function bindGlobalMaterialSearch() {
 
   const close = () => resultsEl.classList.remove('open');
   const locate = (material) => {
-    state.selectedCategoryId = material.categoryId || UNGROUPED;
+    const target = material.categoryId ? Cat.findCategory(state.categories, material.categoryId) : null;
+    // 目标分组缺失或已不是末级（物料会被隐藏）时，落在「全部物料」并按编码定位
+    state.selectedCategoryId = material.categoryId && target?.isLeaf ? target.id : UNGROUPED;
     state.activeTab = 'materials';
     state.search = material.code || material.name || '';
     state.materialPage = 1;
@@ -426,7 +453,7 @@ function applyDrafts() {
   for (const s of DATA_SETS) state[s.live] = sets[s.kind];
   state.materials = materials;
 
-  // 选中分组若被删掉则回退到未分组
+  // 选中的分组若被删掉则回退到未分组
   if (state.selectedCategoryId !== UNGROUPED && !state.categories.some(c => c.id === state.selectedCategoryId)) {
     state.selectedCategoryId = UNGROUPED;
   }
@@ -537,17 +564,27 @@ function renderMaterialsPage() {
 function buildTreePanel() {
   const panel = mk('div', { class: 'cat-panel' });
   const head = mk('div', { class: 'cat-panel-head' });
-  head.appendChild(mk('span', { class: 'ttl' }, '分组'));
-  const addBtn = mk('button', { class: 'btn small' }, '＋ 新建');
+  const ttl = mk('span', { class: 'ttl' }, '分组');
+  // 全部物料总数（叠加未提交的新增/删除），紧跟“分组”显示
+  let totalMaterials = state.baseMaterials.length;
+  for (const draft of state.drafts) {
+    if (draft.kind !== 'material') continue;
+    if (draft.op === 'add') totalMaterials += 1;
+    else if (draft.op === 'delete' && state.baseMaterials.some(item => item.id === draft.recordId)) totalMaterials -= 1;
+  }
+  ttl.appendChild(mk('span', { class: 'tree-total', style: 'margin-left:6px;font-size:12px;color:var(--text-muted);font-weight:400;' },
+    String(totalMaterials)));
+  head.appendChild(ttl);
+  const addBtn = mk('button', { class: 'btn small', title: '新建分组', 'aria-label': '新建分组' }, '＋');
   addBtn.addEventListener('click', () => openCategoryDialog(null));
   head.appendChild(addBtn);
   panel.appendChild(head);
 
   const tree = mk('div', { class: 'tree' });
 
-  // 固定的「未分组」（虚拟节点，categoryId 为空字符串）
-  const ungroupedCount = state.materials.filter(m =>
-    !m.categoryId || !state.categories.some(c => c.id === m.categoryId)).length;
+  // 固定的「未分组」：同时收纳分组缺失或已非末级的异常物料
+  const leafIds = new Set(state.categories.filter(c => c.isLeaf).map(c => c.id));
+  const ungroupedCount = state.materials.filter(m => !m.categoryId || !leafIds.has(m.categoryId)).length;
   tree.appendChild(buildTreeNode({
     depth: 0,
     label: '未分组',
@@ -770,8 +807,51 @@ function buildCatMain() {
 }
 
 // ---------- 物料档案 ----------
+// 分组缺失或已非末级：物料无法在分组树里看到，统一收进「未分组」
+function isLooseCategory(categoryId) {
+  if (!categoryId) return true;
+  const category = Cat.findCategory(state.categories, categoryId);
+  return !category || !category.isLeaf;
+}
+
 async function currentMaterialSummaries() {
   const categoryId = state.selectedCategoryId || UNGROUPED;
+
+  // 未分组：真正的未分组 + 分组缺失/非末级的异常物料
+  if (categoryId === UNGROUPED) {
+    const leafIds = new Set(state.categories.filter(c => c.isLeaf).map(c => c.id));
+    const loose = (id) => !id || !leafIds.has(id);
+    const records = await MaterialStore.listCategory(UNGROUPED);
+    const byId = new Map(records.map(item => [item.id, item]));
+    for (const item of state.materials) {
+      if (!loose(item.categoryId)) continue;
+      byId.set(item.id, item);
+    }
+    for (const draft of state.drafts) {
+      if (draft.kind !== 'material') continue;
+      const base = state.baseMaterials.find(item => item.id === draft.recordId);
+      if (base && loose(base.categoryId)) byId.delete(base.id);
+      if (draft.op !== 'delete' && loose(draft.data.categoryId)) {
+        byId.set(draft.recordId, {
+          id: draft.recordId,
+          categoryId: draft.data.categoryId || '',
+          code: draft.data.code || '',
+          name: draft.data.name || '',
+          path: base?.path || '',
+        });
+      }
+    }
+    const kw = state.search.trim().toLowerCase();
+    let list = Array.from(byId.values());
+    if (kw) {
+      list = list.filter(m =>
+        String(m.code || '').toLowerCase().includes(kw) ||
+        String(m.name || '').toLowerCase().includes(kw));
+    }
+    return list.sort((a, b) =>
+      String(a.code || '').localeCompare(String(b.code || ''), 'zh', { numeric: true }));
+  }
+
   const records = await MaterialStore.listCategory(categoryId);
   const byId = new Map(records.map(item => [item.id, item]));
 
@@ -811,7 +891,7 @@ function buildMaterialsPanel(cat) {
   const panel = mk('div', { class: 'tab-panel' });
 
   const bar = mk('div', { class: 'toolbar' });
-  const search = mk('input', { type: 'search', placeholder: '搜索当前分类：物料编码 / 名称' });
+  const search = mk('input', { type: 'search', placeholder: state.selectedCategoryId === UNGROUPED ? '搜索未分组及异常分组物料：物料编码 / 名称' : '搜索当前分类：物料编码 / 名称' });
   search.value = state.search;
   let searchTimer = null;
   search.addEventListener('input', e => {
@@ -956,18 +1036,22 @@ async function renderMaterialsTable(panel, cat) {
     }
   }
 
+  // 属性列覆盖当前筛选结果；未分组固定不显示属性列和分组列
+  const attrCols = state.selectedCategoryId === UNGROUPED ? [] : attrDefs;
   const thChk = mk('th', { class: 'col-chk' });
   thChk.appendChild(chkAll);
   head.appendChild(thChk);
-  const headLabels = ['物料编码', '物料名称', ...attrDefs.map(d => d.label), '保存状态', '最近编辑', '编辑人'];
-  const headClasses = ['col-code', 'col-name', ...attrDefs.map(() => 'col-attr'), 'col-attr', 'col-attr', 'col-attr'];
+  const headLabels = ['物料编码', '物料名称',
+    ...attrCols.map(d => d.label), '保存状态', '最近编辑时间', '编辑人'];
+  const headClasses = ['col-code', 'col-name',
+    ...attrCols.map(() => 'col-attr'), 'col-attr', 'col-attr', 'col-attr'];
   headLabels.forEach((t, i) => head.appendChild(mk('th', { class: headClasses[i] }, t)));
   head.appendChild(mk('th', { class: 'col-ops' }, '操作'));
   table.appendChild(head);
 
   if (!list.length) {
     const tr = mk('tr');
-    tr.appendChild(mk('td', { colspan: attrDefs.length + 7, class: 'empty' }, '暂无物料'));
+    tr.appendChild(mk('td', { colspan: attrCols.length + 7, class: 'empty' }, '暂无物料'));
     table.appendChild(tr);
   }
 
@@ -987,7 +1071,7 @@ async function renderMaterialsTable(panel, cat) {
 
     tr.appendChild(mk('td', { class: 'col-code' + (isTempCode(m.code) ? ' muted' : '') }, m.code || '待提交'));
     tr.appendChild(mk('td', { class: 'col-name' }, m.name || ''));
-    for (const def of attrDefs) {
+    for (const def of attrCols) {
       tr.appendChild(mk('td', { class: 'wrap col-attr' }, Cat.fmtAttrValue(def, m.attrs?.[def.key])));
     }
     const locTd = mk('td', { class: 'col-attr' });
@@ -1036,6 +1120,13 @@ async function renderMaterialsTable(panel, cat) {
 
 // 保存状态：已保存=与仓库一致，未保存=还有未提交的本地改动
 function buildLocationCell(m) {
+  // 所属分组缺失或已非末级：物料在分组树里看不到，状态直接标红提示
+  if (m.categoryId && isLooseCategory(m.categoryId)) {
+    const span = mk('span', { class: 'loc warn', title: '所属分组已不存在或不是末级分组', style: 'color:var(--danger);' });
+    span.appendChild(mk('i', { class: 'dot', style: 'background:var(--danger);' }));
+    span.appendChild(document.createTextNode('异常'));
+    return span;
+  }
   const isSaved = !draftOf('material', m.id);
   const span = mk('span', { class: 'loc', title: isSaved ? '已提交到数据仓库' : '有未提交的本地改动' });
   span.appendChild(mk('i', { class: `dot ${isSaved ? 'cloud' : 'local'}` }));
@@ -1060,7 +1151,8 @@ function openMaterialDialog(mat) {
   const isNew = !mat;
 
   // 在哪个分组下点的新增，物料就进哪个分组；弹窗里不再重复选择
-  const catId = mat ? (mat.categoryId || UNGROUPED) : (state.selectedCategoryId || UNGROUPED);
+  const catId = mat ? (isLooseCategory(mat.categoryId) ? UNGROUPED : mat.categoryId)
+    : (state.selectedCategoryId || UNGROUPED);
   const cat = catId ? Cat.findCategory(state.categories, catId) : null;
   // 只有末级分组自己定义的字段才进物料表单（上级定义的字段在分组上统一填，不进物料档案）
   // 末级分组的生效字段（属性集合 + 自有字段），选项来自字典
@@ -1506,14 +1598,17 @@ function buildManagePanel(cat) {
   descInput.value = cat.desc || '';
 
   const kids = Cat.childIds(state.categories, cat.id);
+  const matCount = state.materials.filter(m => m.categoryId === cat.id).length;
   const leafChk = mk('input', { type: 'checkbox' });
   leafChk.checked = !!cat.isLeaf;
-  leafChk.disabled = kids.length > 0;
+  leafChk.disabled = kids.length > 0 || (leafChk.checked && matCount > 0);
   const leafWrap = mk('label', { class: 'checkbox-label' });
   leafWrap.appendChild(leafChk);
   leafWrap.appendChild(document.createTextNode('末级分组'));
   leafWrap.appendChild(infoTip(
-    kids.length ? '已有下一级分组，不可设为末级' : '勾选后可挂物料档案'));
+    kids.length ? '已有下一级分组，不可设为末级'
+      : leafChk.checked && matCount > 0 ? `该分组下还有 ${matCount} 条物料，不能改为非末级；请先转移或删除这些物料`
+        : '勾选后可挂物料档案'));
 
   formGrid.appendChild(fieldBox('名称', nameInput));
   formGrid.appendChild(fieldBox('排序', sortInput));
@@ -1696,6 +1791,11 @@ function buildManagePanel(cat) {
     // 清掉已不属于任何生效字段的残留值
     const validKeys = new Set([...parentKeys, ...ancestorDefs.map(a => a.key), ...keys]);
     for (const k of Object.keys(attrValues)) if (!validKeys.has(k)) delete attrValues[k];
+
+    if (!kids.length && cat.isLeaf && !leafChk.checked) {
+      const count = state.materials.filter(m => m.categoryId === cat.id).length;
+      if (count) { toastErr(`该分组下还有 ${count} 条物料，不能改为非末级`); return; }
+    }
 
     const next = {
       ...cat,
@@ -2451,16 +2551,6 @@ function renderCommit() {  const content = document.getElementById('content');
     `分支 ${state.settings.branch} · 登录账号 ${state.user?.login || '—'}`));
   repoSection.appendChild(repoCard);
 
-  const repoActions = mk('div', { class: 'repo-actions' });
-  const switchBtn = mk('button', { class: 'btn' }, '切换仓库');
-  switchBtn.addEventListener('click', () => location.assign('login.html?step=repos'));
-  const logoutBtn = mk('button', { class: 'btn' }, '退出登录');
-  logoutBtn.addEventListener('click', async () => {
-    if (await confirm('退出登录并清除本机保存的 PAT？', '退出登录')) Auth.logout();
-  });
-  repoActions.appendChild(switchBtn);
-  repoActions.appendChild(logoutBtn);
-  repoSection.appendChild(repoActions);
   repoSection.appendChild(mk('div', { class: 'hint', style: 'margin-top:8px;font-size:12px;color:var(--text-muted);' },
     '数据只写入该仓库；PAT 保存在本机浏览器，退出登录会一并清除。'));
   content.appendChild(repoSection);
@@ -2522,24 +2612,54 @@ function renderCommit() {  const content = document.getElementById('content');
     });
     listSection.appendChild(msgInput);
 
-    const btn = mk('button', { class: 'btn primary', style: 'margin-top:12px;' }, '提交选中项到数据仓库');
+    const actionRow = mk('div', { style: 'display:flex;align-items:center;gap:12px;margin-top:12px;' });
+    const btn = mk('button', { class: 'btn primary' }, '提交选中项到数据仓库');
     btn.addEventListener('click', () => {
       const ids = checkboxes.filter(c => c.checked).map(c => c.dataset.id);
       const includeInit = !!initChk?.checked;
       if (!ids.length && !includeInit) { toastErr('请勾选至少一项'); return; }
       doCommit(ids, msgInput.value.trim(), btn, includeInit);
     });
-    listSection.appendChild(btn);
+    const discard = mk('button', { class: 'btn danger', style: 'margin-left:auto;' }, '丢弃全部草稿');
+    discard.disabled = !state.drafts.length;
+    discard.addEventListener('click', discardAllDrafts);
+    actionRow.append(btn, discard);
+    listSection.appendChild(actionRow);
   }
   content.appendChild(listSection);
 
-  // 清空草稿
-  const dangerSection = mk('div', { class: 'section' });
-  const discard = mk('button', { class: 'btn danger' }, '丢弃全部草稿');
-  discard.disabled = !state.drafts.length;
-  discard.addEventListener('click', discardAllDrafts);
-  dangerSection.appendChild(discard);
-  content.appendChild(dangerSection);
+  // 维护：修复「分片有物料、搜索索引为空」导致全部物料显示 0 条
+  const maintainSection = mk('div', { class: 'section' });
+  maintainSection.appendChild(mk('div', { class: 'section-title' }, '维护'));
+  const rebuildBtn = mk('button', { class: 'btn' }, '重建搜索索引');
+  rebuildBtn.addEventListener('click', () => rebuildSearchIndex(rebuildBtn));
+  maintainSection.appendChild(rebuildBtn);
+  maintainSection.appendChild(mk('div', {
+    class: 'hint',
+    style: 'margin-top:6px;font-size:12px;color:var(--text-muted);',
+  }, '扫描所有分组的分片并重写 search-index.json.gz 与 manifest.json；用于物料档案有数据但「全部物料」显示 0 条的情况。'));
+  content.appendChild(maintainSection);
+}
+
+async function rebuildSearchIndex(btn) {
+  if (!(await confirm('将扫描所有分组的分片并重建全局搜索索引，继续？'))) return;
+  btn.disabled = true;
+  progressStart('扫描分组数据…');
+  try {
+    const ids = ['', ...state.categories.map(c => c.id)];
+    const payload = await MaterialStore.rebuildSearchIndex(ids, (done, total) => progressSet(done, total, '扫描分组'));
+    if (!payload.total) { toastErr('分片里没有找到任何物料'); return; }
+    progressStart('写入搜索索引…');
+    await GH.singleCommit({ message: 'chore: 重建搜索索引', treeChanges: payload.fileChanges, treeDeletes: payload.treeDeletes });
+    toastOk(`已重建搜索索引（${payload.total} 条）`);
+    await refreshRemote();
+    render();
+  } catch (e) {
+    toastErr(e.message || '重建失败');
+  } finally {
+    progressEnd();
+    btn.disabled = false;
+  }
 }
 
 function draftLabel(d) {
@@ -2584,18 +2704,18 @@ async function buildCommitPayload(selectedDrafts, includeInit) {
     if (idx >= 0) target[idx] = next; else target.push(next);
   }
 
-  const textChanges = [];
+  const fileChanges = [];
   for (const s of DATA_SETS) {
     const text = JSON.stringify(sets[s.kind], null, 2) + '\n';
     const touched = selectedDrafts.some(d => d.kind === s.kind);
     const missing = state[s.raw] === null;
     if (missing ? (includeInit || touched) : text !== state[s.raw]) {
-      textChanges.push({ path: s.path, content: text });
+      fileChanges.push({ path: s.path, content: text });
     }
   }
   const materialPayload = await MaterialStore.buildCommitPayload(selectedDrafts, now, includeInit);
   return {
-    textChanges: textChanges.concat(materialPayload.textChanges),
+    fileChanges: fileChanges.concat(materialPayload.fileChanges),
     treeDeletes: materialPayload.treeDeletes,
   };
 }
@@ -2611,8 +2731,8 @@ async function doCommit(selectedIds, message, btn, includeInit) {
       progressStart('整理提交内容…');
       // 新增物料的编码在这里按远端最新数据分配
       const prepared = await prepareDraftsWithCodes(draftsToSubmit);
-      const { textChanges, treeDeletes } = await buildCommitPayload(prepared, includeInit);
-      if (!textChanges.length) {
+      const { fileChanges, treeDeletes } = await buildCommitPayload(prepared, includeInit);
+      if (!fileChanges.length) {
         toastErr('内容与远端一致，无需提交');
         btn.disabled = false;
         btn.textContent = oldText;
@@ -2626,7 +2746,7 @@ async function doCommit(selectedIds, message, btn, includeInit) {
       const result = await GH.singleCommit({
         message: message || fallback,
         baseCommit: state.remoteHead,
-        treeChanges: textChanges,
+        treeChanges: fileChanges,
         treeDeletes,
         onProgress: (done, total, label) => progressSet(done, total, label),
       });

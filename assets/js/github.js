@@ -76,6 +76,15 @@ export function blobToBase64(blob) {
     fr.readAsDataURL(blob);
   });
 }
+export function bytesToBase64(bytes) {
+  // 分块转码，避免大文件一次性展开成参数字符串导致栈溢出
+  let binary = '';
+  const step = 0x8000;
+  for (let i = 0; i < bytes.length; i += step) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + step));
+  }
+  return btoa(binary);
+}
 
 // ---------- 读取 ----------
 
@@ -120,6 +129,24 @@ export async function getFile(path) {
   }
 }
 
+// 取二进制文件（如 gzip 搜索索引）：按 raw 字节读取，避免 base64 文本解码破坏内容
+// 返回 { bytes: Uint8Array }；文件不存在返回 null
+export async function getFileBinary(path) {
+  const { owner, repo, branch } = getRepoSettings();
+  const res = await fetch(
+    `${CONFIG.apiBase}/repos/${owner}/${repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${branch}`,
+    { headers: { ...authHeaders(getToken()), Accept: 'application/vnd.github.raw' } }
+  );
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    const err = new Error(`GitHub API ${res.status} ${res.statusText}: ${body.slice(0, 300)}`);
+    err.status = res.status;
+    throw err;
+  }
+  return { bytes: new Uint8Array(await res.arrayBuffer()) };
+}
+
 // 取附件二进制（用 raw.githubusercontent.com，更快）
 export async function getRawBinary(path) {
   const { owner, repo, branch } = getRepoSettings();
@@ -134,8 +161,9 @@ export async function getRawBinary(path) {
  * @param {Object} opts
  * @param {string} opts.message          commit message
  * @param {string} [opts.baseCommit]     基准 commit sha（不传则自动取分支 HEAD）
- * @param {Array}  opts.treeChanges     [{ path, content: string, blobId?: string }, ...]
- *                                      content 是 UTF-8 文本；二进制附件先 blob 再传 sha
+ * @param {Array}  opts.treeChanges     [{ path, content?: string, base64?: string, sha?: string }, ...]
+ *                                      content 是 UTF-8 文本；二进制内容传 base64；
+ *                                      已在别处建好 blob 时可只传 sha（二进制附件）
  * @param {Array}  [opts.treeDeletes]    [{ path }, ...] — 要从 tree 里移除的路径
  * @returns {Promise<{commitSha:string, treeSha:string}>}
  *
@@ -174,13 +202,13 @@ export async function singleCommit({ message, baseCommit, treeChanges, treeDelet
   let changes = treeChanges;
 
   if (!currentHead) {
-    const idx = changes.findIndex(c => !c.sha && typeof c.content === 'string');
-    if (idx === -1) throw new Error('空仓库首次提交需要至少一个文本文件');
+    const idx = changes.findIndex(c => !c.sha && (typeof c.content === 'string' || c.base64));
+    if (idx === -1) throw new Error('空仓库首次提交需要至少一个文件内容');
     const first = changes[idx];
 
     const put = await ghFetch(
       `${CONFIG.apiBase}/repos/${owner}/${repo}/contents/${first.path.split('/').map(encodeURIComponent).join('/')}`,
-      { method: 'PUT', body: JSON.stringify({ message, content: toBase64(first.content) }) }
+      { method: 'PUT', body: JSON.stringify({ message, content: first.base64 || toBase64(first.content) }) }
     );
     currentHead = put.commit.sha;
 
@@ -203,12 +231,13 @@ export async function singleCommit({ message, baseCommit, treeChanges, treeDelet
 
   const base = await getCommit(currentHead);
 
-  // 2. 并行创建所有 blob（文本内容直接提交）
+  // 2. 并行创建所有 blob（文本转 base64，二进制内容直接使用 base64）
   const createdBlobs = await Promise.all(changes.map(async (change) => {
-    // 如果 change 已经带 sha（二进制附件），直接用；否则把文本转 base64 再建 blob
+    // 如果 change 已经带 sha（二进制附件），直接用
     let sha = change.sha;
     if (!sha) {
-      const body = { content: toBase64(change.content), encoding: 'base64' };
+      const content = change.base64 || toBase64(change.content);
+      const body = { content, encoding: 'base64' };
       const blob = await ghFetch(
         `${CONFIG.apiBase}/repos/${owner}/${repo}/git/blobs`,
         { method: 'POST', body: JSON.stringify(body) }

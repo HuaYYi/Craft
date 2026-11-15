@@ -9,7 +9,8 @@ export const CONFIG = {
   categoriesPath: 'data/categories.json',
   materialsRoot: 'data/materials',
   materialsManifestPath: 'data/materials/manifest.json',
-  materialsSearchIndexPath: 'data/materials/search-index.json',
+  materialsSearchIndexPath: 'data/materials/search-index.json.gz',
+  legacySearchIndexPath: 'data/materials/search-index.json', // 旧格式，读到后会在下次提交时迁移并删除
   legacyMaterialsPath: 'data/materials.json',
   materialChunkSize: 500,
   dictionariesPath: 'data/dictionaries.json',

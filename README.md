@@ -51,7 +51,7 @@ data/categories.json           分组数据
 data/dictionaries.json         字典（选项库）数据
 data/attrSets.json             属性集合数据
 data/materials/manifest.json   物料清单
-data/materials/search-index.json  全局轻量搜索索引
+data/materials/search-index.json.gz  全局轻量搜索索引（紧凑结构 + gzip）
 data/materials/categories/<分类>/index.json  分类索引
 data/materials/categories/<分类>/page-000001.json  完整物料分片（每片最多 500 条）
 ```
@@ -77,7 +77,10 @@ data/materials/categories/<分类>/page-000001.json  完整物料分片（每片
 
 // materials（数据仓库 data/materials/ 下按分类分片；attrs 只存末级分组的生效字段值）
 // manifest.json : { "version":1, "chunkSize":500, "total":0 }
-// search-index.json : [{ "id":"m_x", "categoryId":"c_leaf", "code":"202610270001", "name":"110kV 配电变压器", "path":"data/materials/categories/.../page-000001.json" }]
+// search-index.json.gz : 紧凑结构 + gzip
+//   { "v":2, "cats":["c_leaf"], "items":[[0, 1, "m_x", "202610270001", "110kV 配电变压器"]] }
+//   items 每行 = [分类下标, 分片页码, id, code, name]；分片路径由分类 id + 页码推导
+//   仍兼容读取旧的 search-index.json 数组，下次提交时自动迁移并删除旧文件
 // 分片文件 : [{ "id":"m_x", "categoryId":"c_leaf", "code":"...", "name":"...",
 //              "attrs":{}, "location":"cloud", "syncedAt":"...",
 //              "createdAt":"...", "updatedAt":"...", "createdBy":"", "updatedBy":"" }]

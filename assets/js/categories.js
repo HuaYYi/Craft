@@ -239,7 +239,6 @@ export function moveCategory(categories, id, newParentId, beforeId = null) {
   if (!canMove(categories, id, np)) return [];
   const node = findCategory(categories, id);
   if (!node) return [];
-  const oldParentId = node.parentId ?? null;
 
   const changed = new Map();
   const touch = (c) => changed.set(c.id, c);
@@ -256,17 +255,15 @@ export function moveCategory(categories, id, newParentId, beforeId = null) {
   siblings.splice(idx, 0, node);
   siblings.forEach((c, i) => { if (c.sort !== i) { c.sort = i; touch(c); } });
 
-  // isLeaf 修正：新父级变非末级；旧父级没子级了变末级；自身按实际子级修正
+  // isLeaf 修正：有子级的分组必须是非末级；没有子级时保留用户原本的末级设置
   if (np) {
     const p = findCategory(categories, np);
     if (p && p.isLeaf) { p.isLeaf = false; touch(p); }
   }
-  if (oldParentId && oldParentId !== np) {
-    const op = findCategory(categories, oldParentId);
-    if (op && !categories.some(c => c.parentId === op.id) && !op.isLeaf) { op.isLeaf = true; touch(op); }
+  if (categories.some(c => c.parentId === id) && node.isLeaf) {
+    node.isLeaf = false;
+    touch(node);
   }
-  const selfLeaf = !categories.some(c => c.parentId === id);
-  if (node.isLeaf !== selfLeaf) { node.isLeaf = selfLeaf; touch(node); }
 
   return Array.from(changed.values());
 }
