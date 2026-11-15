@@ -3,49 +3,88 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Craft 系统</title>
-  <link rel="stylesheet" href="assets/css/admin.css" />
+  <title>Craft · 物料与数据管理</title>
+  <meta name="description" content="Craft 物料与数据管理工具，正在开发中。" />
+  <link rel="stylesheet" href="assets/css/public.css" />
 </head>
-<body>
-  <div class="layout">
-    <!-- 左侧导航 -->
-    <aside class="sidebar">
-      <div class="brand">Craft 系统</div>
-      <nav class="nav">
-        <a href="javascript:;" class="nav-item active" data-view="materials">物料及分组</a>
-        <a href="javascript:;" class="nav-item nav-parent" data-view="settings">系统设置<span class="nav-caret">▸</span></a>
-        <a href="javascript:;" class="nav-item nav-sub" data-view="settings" data-sub="dict">字典设置</a>
-        <a href="javascript:;" class="nav-item nav-sub" data-view="settings" data-sub="set">属性集合</a>
-        <a href="icons.html" class="nav-item" target="_blank" rel="noopener">图标库（临时）</a>
-      </nav>
-    </aside>
-
-    <!-- 右侧主区域 -->
-    <div class="main">
-      <header class="topbar">
-        <div class="topbar-title" id="topbarTitle">物料及分组</div>
-        <div class="topbar-actions">
-          <div class="global-material-search" id="globalMaterialSearchWrap">
-            <input id="globalMaterialSearch" type="search" placeholder="全局搜索：物料编码 / 名称" autocomplete="off" />
-            <div class="global-search-results" id="globalMaterialSearchResults"></div>
-          </div>
-          <button class="btn primary commit-btn" id="commitLink">提交管理(0)</button>
-        </div>
-      </header>
-      <section class="content" id="content"></section>
+<body class="landing">
+  <header class="site-header">
+    <a class="site-brand" href="index.html">
+      <span class="brand-mark">C</span>
+      <span>Craft</span>
+    </a>
+    <nav class="site-nav">
+      <a href="#features">功能</a>
+    </nav>
+    <div class="site-actions">
+      <a class="btn" id="enterBtn" href="login.html">登录</a>
     </div>
-  </div>
+  </header>
 
-  <!-- 通用弹窗 -->
-  <div class="modal-mask hidden" id="modalMask">
-    <div class="modal" id="modal"></div>
-  </div>
+  <main>
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">物料与数据管理</p>
+        <h1>让物料信息，清晰有序</h1>
+        <p class="hero-sub">
+          分类分组、物料档案、属性字典、批量导入导出，都在一个界面里完成。
+          系统正在开发中，功能持续完善，敬请期待。
+        </p>
+        <ul class="hero-points">
+          <li>多级分组</li>
+          <li>物料档案</li>
+          <li>属性与字典</li>
+          <li>Excel 导入导出</li>
+        </ul>
+      </div>
+    </section>
 
-  <!-- Toast 容器 -->
-  <div class="toast-wrap" id="toastWrap"></div>
+    <section class="section-block" id="features">
+      <div class="inner">
+        <div class="section-head">
+          <h2>功能</h2>
+          <p>围绕日常物料维护整理的一套工具，正在逐步完善。</p>
+        </div>
+        <div class="feature-grid cols-3">
+          <article class="feature">
+            <div class="feature-index">01</div>
+            <h3>分类分组</h3>
+            <p>不限层级的分组树，可拖拽调整层级与顺序；物料挂在末级分组下。</p>
+          </article>
+          <article class="feature">
+            <div class="feature-index">02</div>
+            <h3>物料档案</h3>
+            <p>物料编码自动生成，属性按所属分组自动带出，新增、修改、删除都在一处。</p>
+          </article>
+          <article class="feature">
+            <div class="feature-index">03</div>
+            <h3>属性与字典</h3>
+            <p>属性字段可自由定义，下拉选项由字典统一维护，修改后所有引用一起生效。</p>
+          </article>
+          <article class="feature">
+            <div class="feature-index">04</div>
+            <h3>批量操作</h3>
+            <p>勾选物料后可批量转移分组或批量删除，减少重复操作。</p>
+          </article>
+          <article class="feature">
+            <div class="feature-index">05</div>
+            <h3>Excel 导入导出</h3>
+            <p>按分组导出物料，修改后按物料编码匹配导入更新。</p>
+          </article>
+          <article class="feature">
+            <div class="feature-index">06</div>
+            <h3>全局搜索</h3>
+            <p>输入物料编码或名称，快速定位到具体物料和所属分组。</p>
+          </article>
+        </div>
+      </div>
+    </section>
+  </main>
 
-  <!-- Excel 读写（本地内置，离线可用） -->
-  <script src="assets/vendor/xlsx.full.min.js"></script>
-  <script type="module" src="assets/js/app.js"></script>
+  <footer class="site-footer">
+    <span>Craft · 正在开发中</span>
+  </footer>
+
+  <script type="module" src="assets/js/landing.js"></script>
 </body>
 </html>

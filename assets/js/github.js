@@ -4,43 +4,50 @@
 // Git Data API 可以一次性把所有 blob 打包进一个 tree → 一个 commit，真正做到「统一提交」。
 
 import { CONFIG, LS_KEYS } from './config.js';
+import { getToken } from './auth.js';
 
 // ---------- 工具 ----------
 
-// PAT 只在内存中，刷新页面即失效（不落 localStorage，避免泄露）
-let _token = '';
-export function setToken(t) { _token = t || ''; }
-export function getToken() { return _token; }
-
-// 从 localStorage 读用户覆盖的仓库信息，没有就用默认值
-export function getGithubSettings() {
+// 当前数据仓库（代码仓库只托管页面，不参与读写）
+export function getRepoSettings() {
   return {
-    owner:  localStorage.getItem(LS_KEYS.owner)  || CONFIG.defaultOwner,
-    repo:   localStorage.getItem(LS_KEYS.repo)   || CONFIG.defaultRepo,
-    branch: localStorage.getItem(LS_KEYS.branch) || CONFIG.defaultBranch,
-    token:  _token,
+    owner:  localStorage.getItem(LS_KEYS.dataOwner)  || CONFIG.defaultDataOwner,
+    repo:   localStorage.getItem(LS_KEYS.dataRepo)   || CONFIG.defaultDataRepo,
+    branch: localStorage.getItem(LS_KEYS.dataBranch) || CONFIG.defaultDataBranch,
+    token:  getToken(),
   };
 }
 
-export function saveGithubSettings({ owner, repo, branch }) {
-  if (owner  != null) localStorage.setItem(LS_KEYS.owner,  owner);
-  if (repo   != null) localStorage.setItem(LS_KEYS.repo,   repo);
-  if (branch != null) localStorage.setItem(LS_KEYS.branch, branch);
+export function saveRepoSettings({ owner, repo, branch }) {
+  if (owner  != null) localStorage.setItem(LS_KEYS.dataOwner,  owner);
+  if (repo   != null) localStorage.setItem(LS_KEYS.dataRepo,   repo);
+  if (branch != null) localStorage.setItem(LS_KEYS.dataBranch, branch);
+}
+
+export function clearRepoSettings() {
+  localStorage.removeItem(LS_KEYS.dataOwner);
+  localStorage.removeItem(LS_KEYS.dataRepo);
+  localStorage.removeItem(LS_KEYS.dataBranch);
 }
 
 function apiUrl(path) {
-  const { owner, repo } = getGithubSettings();
+  const { owner, repo } = getRepoSettings();
   return `${CONFIG.apiBase}/repos/${owner}/${repo}${path}`;
 }
 
-async function ghFetch(url, options = {}) {
-  const { token } = getGithubSettings();
-  const headers = {
+function authHeaders(token) {
+  return {
     Accept: 'application/vnd.github+json',
     'X-GitHub-Api-Version': '2022-11-28',
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+}
+
+async function ghFetch(url, options = {}, token = getToken()) {
+  const headers = {
+    ...authHeaders(token),
     ...(options.headers || {}),
   };
-  if (token) headers.Authorization = `Bearer ${token}`;
 
   const res = await fetch(url, { ...options, headers });
   if (!res.ok) {
@@ -74,7 +81,7 @@ export function blobToBase64(blob) {
 
 // 取分支 HEAD commit
 export async function getBranchHead(branch) {
-  const { owner, repo } = getGithubSettings();
+  const { owner, repo } = getRepoSettings();
   const ref = await ghFetch(`${CONFIG.apiBase}/repos/${owner}/${repo}/git/refs/heads/${branch}`);
   return ref.object.sha;
 }
@@ -92,7 +99,7 @@ export async function getTree(sha, recursive = true) {
 // 通过 contents API 取文件；文件过大（>1MB 会返回 403）或接口异常时降级用 raw
 // 返回 { content: 解码后的文本, sha: 文件 blob sha（raw 降级时为 null）, encoding }
 export async function getFile(path) {
-  const { owner, repo, branch } = getGithubSettings();
+  const { owner, repo, branch } = getRepoSettings();
   try {
     const data = await ghFetch(
       `${CONFIG.apiBase}/repos/${owner}/${repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${branch}`
@@ -103,8 +110,11 @@ export async function getFile(path) {
     return { content: data.content, sha: data.sha, encoding: data.encoding };
   } catch (e) {
     if (e.status === 404) return null; // 文件不存在
-    // Contents API 有 1MB 响应上限，超限会 403；用 raw 兜底读取
-    const res = await fetch(`${CONFIG.rawBase}/${owner}/${repo}/${branch}/${path}`);
+    // Contents API 有 1MB 响应上限，超限会 403；改用 raw 媒体类型再读一次（私有仓库同样适用）
+    const res = await fetch(
+      `${CONFIG.apiBase}/repos/${owner}/${repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${branch}`,
+      { headers: { ...authHeaders(getToken()), Accept: 'application/vnd.github.raw' } }
+    );
     if (!res.ok) return null;
     return { content: await res.text(), sha: null, encoding: 'utf8' };
   }
@@ -112,7 +122,7 @@ export async function getFile(path) {
 
 // 取附件二进制（用 raw.githubusercontent.com，更快）
 export async function getRawBinary(path) {
-  const { owner, repo, branch } = getGithubSettings();
+  const { owner, repo, branch } = getRepoSettings();
   const res = await fetch(`${CONFIG.rawBase}/${owner}/${repo}/${branch}/${path}`);
   if (!res.ok) return null;
   return res.blob();
@@ -134,8 +144,8 @@ export async function getRawBinary(path) {
  *   调用方据此提示用户「请刷新后重试」。
  */
 export async function singleCommit({ message, baseCommit, treeChanges, treeDeletes = [] }) {
-  const { owner, repo, branch, token } = getGithubSettings();
-  if (!token) throw new Error('未配置 GitHub Personal Access Token');
+  const { owner, repo, branch, token } = getRepoSettings();
+  if (!token) throw new Error('登录已失效，请重新登录');
 
   // 1. 拿到当前 HEAD，做冲突比对
   const currentHead = await getBranchHead(branch);
@@ -205,16 +215,47 @@ export async function singleCommit({ message, baseCommit, treeChanges, treeDelet
 
 // 用 PAT 试一下是否有效（读一下 `/user`，200 即通过）
 export async function validateToken(token) {
-  const res = await fetch(`${CONFIG.apiBase}/user`, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'X-GitHub-Api-Version': '2022-11-28',
-      Accept: 'application/vnd.github+json',
-    },
-  });
+  const res = await fetch(`${CONFIG.apiBase}/user`, { headers: authHeaders(token) });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(body.message || `Token 无效 (${res.status})`);
+    const err = new Error(body.message || `Token 无效 (${res.status})`);
+    err.status = res.status;
+    throw err;
   }
   return res.json();
 }
+
+// 登录页：列出该 PAT 可写的仓库（最多 500 个，按最近更新排序）
+export async function listWritableRepos(token) {
+  const repos = [];
+  for (let page = 1; page <= 5; page++) {
+    const url = `${CONFIG.apiBase}/user/repos?per_page=100&sort=updated`
+      + `&affiliation=owner,collaborator,organization_member&page=${page}`;
+    const res = await fetch(url, { headers: authHeaders(token) });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      const err = new Error(body.message || `读取仓库列表失败 (${res.status})`);
+      err.status = res.status;
+      throw err;
+    }
+    const list = await res.json();
+    repos.push(...list);
+    if (list.length < 100) break;
+  }
+  return repos
+    .filter(item => item.permissions?.push)
+    .map(item => ({
+      owner: item.owner?.login || '',
+      repo: item.name,
+      branch: item.default_branch || 'main',
+      private: !!item.private,
+      description: item.description || '',
+      updatedAt: item.updated_at || '',
+    }));
+}
+
+// 登录页：确认仓库可访问，并返回默认分支
+export async function getRepo(owner, repo, token = getToken()) {
+  return ghFetch(`${CONFIG.apiBase}/repos/${owner}/${repo}`, {}, token);
+}
+

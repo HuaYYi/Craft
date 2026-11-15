@@ -1,4 +1,6 @@
-// app.js —— 状态编排
+// app.js —— 管理端状态编排
+//
+// 数据来源：登录页选择的独立私有数据仓库（代码仓库只托管页面，不含数据）
 //
 // 数据模型
 //   categories.json : [{ id, name, parentId, isLeaf, sort, desc,
@@ -16,6 +18,7 @@
 import { CONFIG, LOCATION, FIELD_TYPES } from './config.js';
 import * as Store from './store.js';
 import * as GH from './github.js';
+import * as Auth from './auth.js';
 import * as Cat from './categories.js';
 import * as Excel from './excel.js';
 import * as MaterialStore from './material-store.js';
@@ -40,8 +43,9 @@ const state = {
   attrSets: [],
   drafts: [],
   settings: null,
-  pat: '',
+  user: null,
   remoteHead: null,
+  missingDataFiles: [],      // 数据仓库首次初始化时需要创建的文件
   // UI 状态
   selectedCategoryId: '',     // '' = 未分组（虚拟节点）；否则为分组 id
   activeTab: 'materials',
@@ -100,14 +104,18 @@ init().catch(e => {
 });
 
 async function init() {
+  if (!Auth.requireLogin()) return;
+  state.user = Auth.getUser();
+  state.settings = GH.getRepoSettings();
+
   await Store.requestPersistent();
 
   // 数据模型版本标记：仅记录，升级时默认保留全部本地数据，不做任何清理
   const MODEL_KEY = 'craft.modelVersion';
   const MODEL_VERSION = '5';
 
-  state.settings = GH.getGithubSettings();
   bindNav();
+  bindAccountBar();
   bindGlobalMaterialSearch();
   bindInfoTips();
   await refreshRemote();
@@ -118,6 +126,17 @@ async function init() {
 
   await loadDrafts();
   render();
+}
+
+function bindAccountBar() {
+  const chip = document.getElementById('repoChip');
+  if (chip) {
+    chip.textContent = `${state.settings.owner}/${state.settings.repo}`;
+    chip.title = `当前数据仓库 · 分支 ${state.settings.branch}`;
+  }
+  document.getElementById('logoutBtn')?.addEventListener('click', async () => {
+    if (await confirm('退出登录并清除本机保存的 PAT？', '退出登录')) Auth.logout();
+  });
 }
 
 function bindNav() {
@@ -231,40 +250,49 @@ function render() {
 
 // ---------- 远端读取 ----------
 async function refreshRemote() {
-  GH.setToken(state.pat);
   setLoading();
   try {
     const texts = {};
+    state.missingDataFiles = [];
 
-    if (state.pat) {
-      try {
-        state.remoteHead = await GH.getBranchHead(state.settings.branch);
-      } catch (_) { state.remoteHead = null; }
-      for (const s of DATA_SETS) {
-        const f = await GH.getFile(s.path);
-        texts[s.kind] = f ? f.content : null;
+    // 先确认仓库可访问，避免把“无权限”误判成“空仓库”
+    try {
+      await GH.getRepo(state.settings.owner, state.settings.repo);
+    } catch (e) {
+      if (e.status === 401) {
+        Auth.clearToken();
+        Auth.clearUser();
+        location.replace('login.html');
+        return;
       }
-    } else {
-      state.remoteHead = null;
-      for (const s of DATA_SETS) {
-        try {
-          const r = await fetch(s.path);
-          texts[s.kind] = r.ok ? await r.text() : null;
-        } catch (_) {
-          texts[s.kind] = null;
-        }
+      if (e.status === 404) {
+        toastErr('数据仓库不存在或当前 PAT 无权访问，请重新选择仓库');
+        return;
       }
+      throw e;
+    }
+
+    try {
+      state.remoteHead = await GH.getBranchHead(state.settings.branch);
+    } catch (_) { state.remoteHead = null; }
+
+    for (const s of DATA_SETS) {
+      const f = await GH.getFile(s.path);
+      texts[s.kind] = f ? f.content : null;
+      if (!f) state.missingDataFiles.push(s.path);
     }
 
     for (const s of DATA_SETS) {
       state[s.base] = texts[s.kind] ? safeParse(texts[s.kind], []) : [];
-      state[s.raw] = texts[s.kind] || '[]';
+      state[s.raw] = texts[s.kind] || null;
     }
-    const materialData = await MaterialStore.loadRemote(!!state.pat);
+    const materialData = await MaterialStore.loadRemote();
     state.baseMaterials = materialData.materials;
+    state.missingDataFiles.push(...materialData.missingPaths);
   } catch (e) {
     console.warn('远端读取失败', e);
-    toastErr('远端同步失败：' + (e.message || e));
+    state.missingDataFiles = [];
+    toastErr('数据仓库读取失败：' + (e.message || e));
   }
 }
 
@@ -326,7 +354,8 @@ function applyDrafts() {
 }
 
 function updateCommitBadge() {
-  document.getElementById('commitLink').textContent = `提交管理(${state.drafts.length})`;
+  const initCount = state.missingDataFiles.length ? 1 : 0;
+  document.getElementById('commitLink').textContent = `提交管理(${state.drafts.length + initCount})`;
 }
 
 async function saveCategoryDraft(cat, op) {
@@ -2313,76 +2342,63 @@ async function doDeleteAttrSet(set, usedBy) {
   toastOk('已标记为删除');
 }
 
-function settingRow(label, input, hint) {
-  const row = mk('div', { class: 'row' });
-  row.appendChild(mk('label', {}, label));
-  row.appendChild(input);
-  if (hint) row.appendChild(mk('div', { class: 'hint' }, hint));
-  return row;
-}
-
 // ---------- 提交管理 ----------
-function renderCommit() {
-  const content = document.getElementById('content');
+function renderCommit() {  const content = document.getElementById('content');
   content.className = 'content scroll';
   content.innerHTML = '';
 
   content.appendChild(mk('h2', { style: 'margin:0 0 4px;font-size:15px;' }, '提交管理'));
   content.appendChild(mk('p', { class: 'muted', style: 'margin:0 0 16px;font-size:12px;' },
-    '所有改动先暂存在浏览器（IndexedDB），勾选后一次性提交到 GitHub；提交成功后自动清空已提交的草稿。'));
+    '所有改动先暂存在浏览器（IndexedDB），勾选后一次性提交到数据仓库；提交成功后自动清空已提交的草稿。'));
 
-  // PAT
-  const patSection = mk('div', { class: 'section' });
-  patSection.appendChild(mk('div', { class: 'section-title' }, 'GitHub Token'));
-  const patInput = mk('input', {
-    type: 'password',
-    value: state.pat,
-    placeholder: 'github_pat_xxxxxxxx',
-    autocomplete: 'off',
-    style: 'width:100%;padding:6px 10px;border:1px solid var(--border-strong);border-radius:6px;',
-  });
-  patInput.addEventListener('input', () => {
-    state.pat = patInput.value.trim();
-    GH.setToken(state.pat);
-  });
-  patSection.appendChild(patInput);
-  patSection.appendChild(mk('div', { class: 'hint', style: 'margin-top:6px;font-size:12px;color:var(--text-muted);' },
-    'Fine-grained PAT，仅授予本仓库 Contents: Read and write。Token 只存在内存，刷新即清除。'));
-  content.appendChild(patSection);
-
-  // 仓库设置（原「设置」页并入这里：提交目标仓库）
+  // 当前账号与数据仓库
   const repoSection = mk('div', { class: 'section' });
-  repoSection.appendChild(mk('div', { class: 'section-title' }, '仓库设置'));
-  const ownerInput = mk('input', { type: 'text', value: state.settings.owner });
-  const repoInput = mk('input', { type: 'text', value: state.settings.repo });
-  const branchInput = mk('input', { type: 'text', value: state.settings.branch });
-  repoSection.appendChild(settingRow('Owner', ownerInput));
-  repoSection.appendChild(settingRow('Repo', repoInput));
-  repoSection.appendChild(settingRow('Branch', branchInput));
-  const repoSave = mk('button', { class: 'btn' }, '保存仓库设置');
-  repoSave.addEventListener('click', async () => {
-    const owner = ownerInput.value.trim();
-    const repo = repoInput.value.trim();
-    const branch = branchInput.value.trim();
-    if (!owner || !repo || !branch) { toastErr('请填写完整'); return; }
-    GH.saveGithubSettings({ owner, repo, branch });
-    state.settings = GH.getGithubSettings();
-    toastOk('已保存，正在重新同步…');
-    await refreshRemote();
-    await loadDrafts();
-    render();
+  repoSection.appendChild(mk('div', { class: 'section-title' }, '数据仓库'));
+  const repoCard = mk('div', { class: 'repo-summary' });
+  repoCard.appendChild(mk('div', { class: 'repo-summary-name' }, `${state.settings.owner}/${state.settings.repo}`));
+  repoCard.appendChild(mk('div', { class: 'repo-summary-meta' },
+    `分支 ${state.settings.branch} · 登录账号 ${state.user?.login || '—'}`));
+  repoSection.appendChild(repoCard);
+
+  const repoActions = mk('div', { class: 'repo-actions' });
+  const switchBtn = mk('button', { class: 'btn' }, '切换仓库');
+  switchBtn.addEventListener('click', () => location.assign('login.html?step=repos'));
+  const logoutBtn = mk('button', { class: 'btn' }, '退出登录');
+  logoutBtn.addEventListener('click', async () => {
+    if (await confirm('退出登录并清除本机保存的 PAT？', '退出登录')) Auth.logout();
   });
-  repoSection.appendChild(repoSave);
+  repoActions.appendChild(switchBtn);
+  repoActions.appendChild(logoutBtn);
+  repoSection.appendChild(repoActions);
+  repoSection.appendChild(mk('div', { class: 'hint', style: 'margin-top:8px;font-size:12px;color:var(--text-muted);' },
+    '数据只写入该仓库；PAT 保存在本机浏览器，退出登录会一并清除。'));
   content.appendChild(repoSection);
+
+  // 首次进入空仓库：初始化基础文件，进入提交管理统一提交
+  let initChk = null;
+  if (state.missingDataFiles.length) {
+    const initSection = mk('div', { class: 'section' });
+    initSection.appendChild(mk('div', { class: 'section-title' }, '仓库初始化'));
+    const row = mk('label', { class: 'checkbox-label' });
+    initChk = mk('input', { type: 'checkbox' });
+    initChk.checked = true;
+    row.appendChild(initChk);
+    row.appendChild(document.createTextNode(` 创建 ${state.missingDataFiles.length} 个基础数据文件`));
+    initSection.appendChild(row);
+    initSection.appendChild(mk('div', { class: 'hint', style: 'margin-top:6px;font-size:12px;color:var(--text-muted);' },
+      state.missingDataFiles.join('、')));
+    content.appendChild(initSection);
+  }
 
   // 改动列表
   const listSection = mk('div', { class: 'section' });
   listSection.appendChild(mk('div', { class: 'section-title' }, `待提交改动（${state.drafts.length}）`));
+  const checkboxes = [];
 
   if (!state.drafts.length) {
-    listSection.appendChild(mk('div', { class: 'empty', style: 'padding:24px;' }, '暂无待提交改动'));
+    listSection.appendChild(mk('div', { class: 'empty', style: 'padding:24px;' },
+      state.missingDataFiles.length ? '暂无草稿改动，仅需初始化仓库' : '暂无待提交改动'));
   } else {
-    const checkboxes = [];
     const selAllRow = mk('label', { class: 'checkbox-label', style: 'margin-bottom:6px;' });
     const selAll = mk('input', { type: 'checkbox' });
     selAll.checked = true;
@@ -2404,7 +2420,10 @@ function renderCommit() {
     listSection.appendChild(ul);
 
     selAll.addEventListener('change', () => checkboxes.forEach(c => { c.checked = selAll.checked; }));
+  }
 
+  const hasWork = state.drafts.length > 0 || !!initChk;
+  if (hasWork) {
     const msgInput = mk('input', {
       type: 'text',
       placeholder: '提交说明（留空自动生成）',
@@ -2412,12 +2431,12 @@ function renderCommit() {
     });
     listSection.appendChild(msgInput);
 
-    const btn = mk('button', { class: 'btn primary', style: 'margin-top:12px;' }, '提交选中项到 GitHub');
+    const btn = mk('button', { class: 'btn primary', style: 'margin-top:12px;' }, '提交选中项到数据仓库');
     btn.addEventListener('click', () => {
       const ids = checkboxes.filter(c => c.checked).map(c => c.dataset.id);
-      if (!ids.length) { toastErr('请勾选至少一项'); return; }
-      if (!state.pat) { toastErr('请先填写 GitHub Token'); return; }
-      doCommit(ids, msgInput.value.trim(), btn);
+      const includeInit = !!initChk?.checked;
+      if (!ids.length && !includeInit) { toastErr('请勾选至少一项'); return; }
+      doCommit(ids, msgInput.value.trim(), btn, includeInit);
     });
     listSection.appendChild(btn);
   }
@@ -2457,7 +2476,7 @@ async function discardAllDrafts() {
 }
 
 // ---------- 提交 ----------
-async function buildCommitPayload(selectedDrafts) {
+async function buildCommitPayload(selectedDrafts, includeInit) {
   const now = nowISO();
   const sets = {};
   for (const s of DATA_SETS) sets[s.kind] = clone(state[s.base]);
@@ -2477,28 +2496,34 @@ async function buildCommitPayload(selectedDrafts) {
   const textChanges = [];
   for (const s of DATA_SETS) {
     const text = JSON.stringify(sets[s.kind], null, 2) + '\n';
-    if (text !== state[s.raw]) textChanges.push({ path: s.path, content: text });
+    const touched = selectedDrafts.some(d => d.kind === s.kind);
+    const missing = state[s.raw] === null;
+    if (missing ? (includeInit || touched) : text !== state[s.raw]) {
+      textChanges.push({ path: s.path, content: text });
+    }
   }
-  const materialPayload = await MaterialStore.buildCommitPayload(selectedDrafts, now);
+  const materialPayload = await MaterialStore.buildCommitPayload(selectedDrafts, now, includeInit);
   return {
     textChanges: textChanges.concat(materialPayload.textChanges),
     treeDeletes: materialPayload.treeDeletes,
   };
 }
 
-async function doCommit(selectedIds, message, btn) {
+async function doCommit(selectedIds, message, btn, includeInit) {
   const draftsToSubmit = state.drafts.filter(d => selectedIds.includes(d.id));
   btn.disabled = true;
   const oldText = btn.textContent;
   btn.textContent = '提交中…';
 
   try {
-    GH.setToken(state.pat);
-    const { textChanges, treeDeletes } = await buildCommitPayload(draftsToSubmit);
+    const { textChanges, treeDeletes } = await buildCommitPayload(draftsToSubmit, includeInit);
     if (!textChanges.length) { toastErr('内容与远端一致，无需提交'); btn.disabled = false; btn.textContent = oldText; return; }
 
+    const fallback = draftsToSubmit.length
+      ? `chore: Craft 系统提交（${draftsToSubmit.length} 项）`
+      : 'chore: 初始化数据仓库';
     const result = await GH.singleCommit({
-      message: message || `chore: Craft 系统提交（${draftsToSubmit.length} 项）`,
+      message: message || fallback,
       baseCommit: state.remoteHead,
       treeChanges: textChanges,
       treeDeletes,

@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>登录 · Craft</title>
+  <link rel="stylesheet" href="assets/css/public.css" />
+</head>
+<body class="login">
+  <div class="login-shell">
+    <aside class="login-aside">
+      <a class="site-brand" href="index.html">
+        <span class="brand-mark">C</span>
+        <span>Craft</span>
+      </a>
+      <div>
+        <h1>物料与数据管理</h1>
+        <ul class="login-points">
+          <li><strong>仅限内部</strong>系统仍在开发中，账号不对外发放。</li>
+          <li><strong>记住账号</strong>勾选后可免重复输入，公用设备请勿勾选。</li>
+          <li><strong>随时退出</strong>退出后会清除本机保存的账号信息。</li>
+        </ul>
+      </div>
+      <div class="login-note">如无法登录，请联系管理员。</div>
+    </aside>
+
+    <main class="login-main">
+      <div class="login-card">
+        <section id="stepToken">
+          <h2>登录</h2>
+          <p class="muted">请输入账号，点击下一步。</p>
+
+          <label class="field">
+            <span>账号</span>
+            <input id="tokenInput" type="password" placeholder="请输入账号" autocomplete="off" spellcheck="false" />
+          </label>
+
+          <label class="check">
+            <input id="rememberChk" type="checkbox" checked />
+            <span>记住账号</span>
+          </label>
+
+          <p class="error" id="tokenError"></p>
+          <button class="btn primary block" id="connectBtn" type="button">下一步</button>
+        </section>
+
+        <section id="stepRepo" hidden>
+          <div class="account-line">
+            <span>当前账号：<span id="accountName"></span></span>
+            <button class="link-btn" id="backBtn" type="button">更换账号</button>
+          </div>
+
+          <h2>选择数据</h2>
+          <p class="muted">选择一个数据位置。</p>
+
+          <div class="repo-picker">
+            <div class="repo-toolbar">
+              <input id="repoSearch" type="search" placeholder="选择数据" autocomplete="off" />
+            </div>
+            <div class="repo-list" id="repoList"></div>
+          </div>
+
+          <label class="field">
+            <span>分支</span>
+            <input id="branchInput" type="text" placeholder="main" autocomplete="off" />
+          </label>
+
+          <p class="error" id="repoError"></p>
+
+          <div class="form-actions">
+            <button class="btn" id="manualToggle" type="button">手动填写</button>
+            <button class="btn primary" id="enterBtn" type="button">进入</button>
+          </div>
+
+          <div class="manual-box" id="manualBox" hidden>
+            <label class="field">
+              <span>账户</span>
+              <input id="ownerInput" type="text" placeholder="账户名称" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>名称</span>
+              <input id="repoInput" type="text" placeholder="数据名称" autocomplete="off" />
+            </label>
+          </div>
+
+          <div class="login-note">第一次使用时，系统会提示初始化基础数据。</div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <script type="module" src="assets/js/login.js"></script>
+</body>
+</html>

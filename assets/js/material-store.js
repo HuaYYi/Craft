@@ -6,7 +6,6 @@ const clone = (v) => JSON.parse(JSON.stringify(v));
 const defaultManifest = () => ({ version: 1, chunkSize: CONFIG.materialChunkSize, total: 0 });
 const defaultCategory = (categoryId) => ({ categoryId: categoryId || '', seq: 0, chunks: [], records: [] });
 
-let remoteMode = false;
 let manifest = defaultManifest();
 let baseIndex = [];
 let remoteCategoryIds = new Set();
@@ -38,16 +37,8 @@ function categoryIndexPath(categoryId) {
 }
 
 async function readJson(path) {
-  let text = null;
-  if (remoteMode) {
-    const file = await GH.getFile(path);
-    text = file?.content ?? null;
-  } else {
-    const res = await fetch(path);
-    if (res.ok) text = await res.text();
-    else if (res.status !== 404) throw new Error(`读取 ${path} 失败（${res.status}）`);
-  }
-  return text == null ? null : JSON.parse(text);
+  const file = await GH.getFile(path);
+  return file ? JSON.parse(file.content) : null;
 }
 
 async function getShard(path) {
@@ -86,18 +77,20 @@ async function getCategory(categoryId) {
   return categoryCache.get(key);
 }
 
-export async function loadRemote(useRemote) {
-  remoteMode = useRemote;
+export async function loadRemote() {
   shardCache.clear();
   categoryCache.clear();
-  const [manifestData, searchData] = await Promise.all([
-    readJson(CONFIG.materialsManifestPath),
-    readJson(CONFIG.materialsSearchIndexPath),
+  const [manifestFile, searchFile] = await Promise.all([
+    GH.getFile(CONFIG.materialsManifestPath),
+    GH.getFile(CONFIG.materialsSearchIndexPath),
   ]);
-  manifest = { ...defaultManifest(), ...(manifestData || {}) };
-  baseIndex = Array.isArray(searchData) ? searchData : [];
+  const missingPaths = [];
+  if (!manifestFile) missingPaths.push(CONFIG.materialsManifestPath);
+  if (!searchFile) missingPaths.push(CONFIG.materialsSearchIndexPath);
+  manifest = { ...defaultManifest(), ...(manifestFile ? JSON.parse(manifestFile.content) : {}) };
+  baseIndex = searchFile ? (JSON.parse(searchFile.content) || []) : [];
   remoteCategoryIds = new Set(baseIndex.map(item => item.categoryId || ''));
-  return { manifest: clone(manifest), materials: clone(baseIndex) };
+  return { manifest: clone(manifest), materials: clone(baseIndex), missingPaths };
 }
 
 export async function listCategory(categoryId) {
@@ -120,10 +113,10 @@ export async function hydrate(entries) {
   });
 }
 
-// 仅重建本次草稿影响的分类索引和分片，不读取或上传完整物料库。
-export async function buildCommitPayload(selectedDrafts, syncedAt) {
+// 仅重建本次草稿影响的分类索引和分片；init=true 时额外写入首次需要的空索引。
+export async function buildCommitPayload(selectedDrafts, syncedAt, init = false) {
   const drafts = selectedDrafts.filter(d => d.kind === 'material');
-  if (!drafts.length) return { textChanges: [], treeDeletes: [] };
+  if (!drafts.length && !init) return { textChanges: [], treeDeletes: [] };
 
   const work = clone(baseIndex);
   const byId = new Map(work.map(item => [item.id, item]));

@@ -17,27 +17,43 @@
   - 属性集合：一整套属性模板，供分组管理关联（一个分组最多关联一个集合；关联字段只读，只能在集合里改）。关联时**替换**本组原有字段并清理这些字段已填的值（分组属性值 + 物料属性值），保存前会弹窗列明影响范围并要求确认；清理只写草稿，提交前可丢弃
 - **批量操作**：勾选后批量转移分组（含转移到「未分组」）、批量删除
 - **Excel**：按当前分组导出（含子分组全部物料），列只有「物料编码 / 物料名称 / 各属性列 / 分组」；按物料编码自然排序；多级分组合并为一列「分组」用 `\` 分隔（如 `父级1\子级1`），分组为空即未分组；不导出内部 ID、位置、时间、创建人/修改人等内部状态；改完再导入，按「物料编码」匹配更新，Excel 里为空的属性保留原值，分组路径自动解析/创建，改过分组的物料会落到新分组
-- **统一提交**：右侧竖排操作列 + 顶部「提交管理(N)」，勾选改动 → 一个 Git commit → 清空已提交草稿；仓库设置（Owner/Repo/Branch）也在这个页面
-- **PAT 只在内存**，刷新即失效，不写 localStorage
+- **统一提交**：右侧竖排操作列 + 顶部「提交管理(N)」，勾选改动 → 一个 Git commit → 清空已提交草稿；提交目标是登录时选择的数据仓库
+- **代码与数据分离**：本仓库只托管页面和脚本，不含任何数据；物料、分组、字典和属性集合都读写独立的私有数据仓库
+- **PAT 登录**：登录页输入 GitHub PAT → 选择可写仓库 → 进入管理端；可勾选记住账号，退出登录会清除本机保存的 PAT
 
 ## 目录
 
 ```
-index.html                    入口
-assets/css/admin.css          样式
-assets/js/config.js           默认仓库配置 / 字段类型 / 位置枚举
-assets/js/store.js            IndexedDB 草稿缓存
-assets/js/github.js           Git Data API（blobs → tree → commit → ref）
-assets/js/categories.js       分组树构建 / 路径 / 属性继承
-assets/js/excel.js            Excel 导入导出（SheetJS）
-assets/js/fields.js           动态表单渲染与校验
-assets/js/ui.js               Toast / Modal / confirm
-assets/js/app.js              页面编排
+index.html                    官网首页（公开）
+login.html                    登录页（PAT 验证 → 选择数据仓库）
+admin.html                    管理端
+assets/css/public.css          官网 / 登录页样式
+assets/css/admin.css           管理端样式
+assets/js/config.js            字段类型 / 位置枚举 / 数据文件路径
+assets/js/auth.js              登录态：PAT、账号、数据仓库
+assets/js/login.js             登录页流程
+assets/js/landing.js           官网入口跳转
+assets/js/store.js             IndexedDB 草稿缓存
+assets/js/github.js            GitHub API（用户仓库列表、Git Data API 提交）
+assets/js/material-store.js    物料分片按需加载与增量提交
+assets/js/categories.js        分组树构建 / 路径 / 属性继承
+assets/js/excel.js             Excel 导入导出（SheetJS）
+assets/js/fields.js            动态表单渲染与校验
+assets/js/ui.js                Toast / Modal / confirm
+assets/js/app.js               管理端页面编排
 assets/vendor/xlsx.full.min.js  SheetJS（本地内置，离线可用）
-data/categories.json          分组数据
-data/materials.json           物料数据
-data/dictionaries.json        字典（选项库）数据
-data/attrSets.json            属性集合数据
+```
+
+数据仓库（登录后选择）中的结构：
+
+```
+data/categories.json           分组数据
+data/dictionaries.json         字典（选项库）数据
+data/attrSets.json             属性集合数据
+data/materials/manifest.json   物料清单
+data/materials/search-index.json  全局轻量搜索索引
+data/materials/categories/<分类>/index.json  分类索引
+data/materials/categories/<分类>/page-000001.json  完整物料分片（每片最多 500 条）
 ```
 
 ## 数据结构
@@ -59,21 +75,21 @@ data/attrSets.json            属性集合数据
 [{ "id":"set_x", "name":"电缆通用属性",
    "attrs":[{"key":"voltage","label":"电压","type":"number"},{"key":"use","label":"用途","type":"text"}] }]
 
-// materials.json（attrs 只存末级分组的生效字段值，每个物料各自一份）
-[{ "id":"m_x", "categoryId":"c_leaf", "code":"202610270001", "name":"110kV 配电变压器",
-   "attrs":{}, "location":"cloud", "syncedAt":"2026-10-26T...",
-   "createdAt":"...", "updatedAt":"...", "createdBy":"", "updatedBy":"" }]
+// materials（数据仓库 data/materials/ 下按分类分片；attrs 只存末级分组的生效字段值）
+// manifest.json : { "version":1, "chunkSize":500, "total":0 }
+// search-index.json : [{ "id":"m_x", "categoryId":"c_leaf", "code":"202610270001", "name":"110kV 配电变压器", "path":"data/materials/categories/.../page-000001.json" }]
+// 分片文件 : [{ "id":"m_x", "categoryId":"c_leaf", "code":"...", "name":"...",
+//              "attrs":{}, "location":"cloud", "syncedAt":"...",
+//              "createdAt":"...", "updatedAt":"...", "createdBy":"", "updatedBy":"" }]
 ```
 
 ## 本地运行
 
-```bash
-python -m http.server 8080
-# 浏览器打开 http://localhost:8080
-```
+双击 `启动.bat`（Windows 自带 HttpListener，无需 Node / Python），浏览器会打开 `http://localhost:8765`。
 
-## 提交流程
+## 使用流程
 
-1. 右上角「提交管理(N)」→ 确认 Owner / Repo / Branch → 填入 Fine-grained PAT（本仓库 Contents: Read and write）
-2. 勾选要提交的改动 → 填写说明 → 提交
-3. 一次 commit 写入 `data/categories.json` / `materials.json` / `dictionaries.json` / `attrSets.json`（有变化的才写），已提交草稿自动清空
+1. 在数据仓库所在账号下创建 Fine-grained PAT，仅勾选数据仓库，授予 Contents: Read and write 与 Metadata: Read-only
+2. 打开官网 → 登录 → 输入 PAT → 选择可写的数据仓库 → 进入管理端
+3. 首次进入空仓库时，提交管理会提供「仓库初始化」，一次提交创建基础数据文件
+4. 日常维护后，在提交管理勾选改动 → 提交，只写入受影响的分片和索引，已提交草稿自动清空
