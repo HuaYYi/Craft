@@ -66,21 +66,48 @@ const nowISO = () => new Date().toISOString();
 // 当前视图要挂到页面右栏的图标工具栏（由各面板构建时塞进来，页面统一放到右栏）
 let pendingRail = null;
 
-// 物料编码自动生成：年月日 + 四位流水号（如 202610270001）
-// 当天已用过的序号往后顺延；草稿里的新物料也算在内，避免重复
-function nextMaterialCode() {
+// 物料编码在提交时才分配：按远端最新索引算当天最大流水，避免多人同时编辑重号
+function todayPrefix() {
   const d = new Date();
-  const prefix = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
-  const used = new Set();
-  for (const m of state.materials) {
-    const code = String(m.code || '');
-    if (!code.startsWith(prefix)) continue;
+  return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+}
+
+async function prepareDraftsWithCodes(drafts) {
+  const adds = drafts
+    .filter(d => d.kind === 'material' && d.op === 'add')
+    .sort((a, b) => String(a.data?.createdAt || '').localeCompare(String(b.data?.createdAt || ''))
+      || String(a.recordId).localeCompare(String(b.recordId)));
+  if (!adds.length) return drafts;
+
+  const file = await GH.getFile(CONFIG.materialsSearchIndexPath);
+  const index = file ? (JSON.parse(file.content) || []) : [];
+  const prefix = todayPrefix();
+  const used = new Set(index.map(item => String(item?.code || '')).filter(Boolean));
+  let maxSeq = 0;
+  const bump = (code) => {
+    if (!code.startsWith(prefix)) return;
     const seq = Number(code.slice(prefix.length));
-    if (Number.isInteger(seq) && seq > 0) used.add(seq);
+    if (Number.isInteger(seq) && seq > maxSeq) maxSeq = seq;
+  };
+  for (const code of used) bump(code);
+  // 导入时自带编码的新物料保留原编码，只给空编码的分配
+  for (const draft of adds) {
+    const code = String(draft.data?.code || '').trim();
+    if (code) { used.add(code); bump(code); }
   }
-  let seq = 1;
-  while (used.has(seq)) seq++;
-  return prefix + String(seq).padStart(4, '0');
+
+  const assigned = new Map();
+  for (const draft of adds) {
+    if (String(draft.data?.code || '').trim()) continue;
+    let seq = maxSeq + 1;
+    let code = prefix + String(seq).padStart(4, '0');
+    while (used.has(code)) { seq += 1; code = prefix + String(seq).padStart(4, '0'); }
+    maxSeq = seq;
+    used.add(code);
+    assigned.set(draft.id, code);
+  }
+  return drafts.map(draft =>
+    assigned.has(draft.id) ? { ...draft, data: { ...draft.data, code: assigned.get(draft.id) } } : draft);
 }
 const clone = (v) => JSON.parse(JSON.stringify(v));
 const UNGROUPED = '';          // 未分组的 categoryId
@@ -137,12 +164,6 @@ async function init() {
 }
 
 function bindAccountBar() {
-  const chip = document.getElementById('repoChip');
-  if (chip) {
-    chip.textContent = `${state.settings.owner}/${state.settings.repo}`;
-    chip.title = `当前数据仓库 · 分支 ${state.settings.branch}`;
-  }
-
   const displayName = state.user?.name || state.user?.login || '?';
   const avatar = document.getElementById('avatarBtn');
   const menu = document.getElementById('accountDropdown');
@@ -949,7 +970,7 @@ async function renderMaterialsTable(panel, cat) {
     tdChk.appendChild(chk);
     tr.appendChild(tdChk);
 
-    tr.appendChild(mk('td', { class: 'col-code' }, m.code || ''));
+    tr.appendChild(mk('td', { class: 'col-code' + (m.code ? '' : ' muted') }, m.code || '待生成'));
     tr.appendChild(mk('td', { class: 'col-name' }, m.name || ''));
     for (const def of attrDefs) {
       tr.appendChild(mk('td', { class: 'wrap col-attr' }, Cat.fmtAttrValue(def, m.attrs?.[def.key])));
@@ -1033,7 +1054,7 @@ function openMaterialDialog(mat) {
   let current = mat
     ? clone(mat)
     : {
-        id: mint('m'), categoryId: catId || UNGROUPED, code: nextMaterialCode(), name: '',
+        id: mint('m'), categoryId: catId || UNGROUPED, code: '', name: '',
         attrs: {}, location: 'local', syncedAt: '',
         createdAt: nowISO(), updatedAt: nowISO(), createdBy: '', updatedBy: '',
       };
@@ -1041,7 +1062,7 @@ function openMaterialDialog(mat) {
   const body = mk('div');
 
   const fields = [
-    { key: 'code', label: '物料编码', type: 'text', required: true },
+    { key: 'code', label: '物料编码', type: 'text', required: !isNew },
     { key: 'name', label: '物料名称', type: 'text', required: true },
     ...defs,
   ];
@@ -1053,10 +1074,11 @@ function openMaterialDialog(mat) {
   const codeInput = form.root.querySelector('#f-code');
   if (codeInput) {
     codeInput.readOnly = true;
-    codeInput.title = '按「年月日 + 四位流水号」自动生成';
+    codeInput.placeholder = '提交后自动生成';
+    codeInput.title = '编码在提交时统一生成，避免多人同时编辑重号';
   }
   body.appendChild(mk('div', { class: 'muted', style: 'margin-top:6px;font-size:12px;' },
-    '物料编码按「年月日 + 四位流水号」自动生成'));
+    isNew ? '物料编码在提交后按「年月日 + 四位流水号」生成' : '物料编码按「年月日 + 四位流水号」自动生成'));
 
   // 保存状态（只读）：有未提交草稿=未保存，与仓库一致=已保存
   const locLine = mk('div', { class: 'muted', style: 'margin-top:12px;font-size:12px;' });
@@ -1084,7 +1106,7 @@ function openMaterialDialog(mat) {
           const v = form.read();
           // 物料编码全局唯一（导入也按编码匹配）
           const code = String(v.code || '').trim();
-          if (state.materials.some(m => m.id !== current.id && (m.code || '') === code)) {
+          if (code && state.materials.some(m => m.id !== current.id && (m.code || '') === code)) {
             toastErr(`物料编码「${code}」已存在`);
             return;
           }
@@ -1140,7 +1162,7 @@ async function doCopyMaterial() {
   const mat = {
     id: mint('m'),
     categoryId: src.categoryId || '',
-    code: nextMaterialCode(),
+    code: '',
     name: `${src.name || src.code}（副本）`,
     attrs: clone(src.attrs || {}),
     location: 'local',
@@ -1153,7 +1175,7 @@ async function doCopyMaterial() {
   await saveMaterialDraft(mat, 'add');
   state.checked.clear();
   render();
-  toastOk(`已复制为 ${mat.code}`);
+  toastOk('已复制，提交后生成编码');
 }
 
 // ---------- 分组选择器（可搜索下拉） ----------
@@ -2527,7 +2549,7 @@ function draftLabel(d) {
     return `【属性集合】${opText} ${d.data?.name || d.recordId}（${d.data?.attrs?.length || 0} 个属性）`;
   }
   const catName = d.data?.categoryId ? Cat.categoryPathString(state.categories, d.data.categoryId) : '';
-  return `【物料】${opText} ${d.data?.code || d.recordId}${d.data?.name ? ' ' + d.data.name : ''}${catName ? '（' + catName + '）' : ''}`;
+  return `【物料】${opText} ${d.data?.code || '待生成'}${d.data?.name ? ' ' + d.data.name : ''}${catName ? '（' + catName + '）' : ''}`;
 }
 
 async function discardAllDrafts() {
@@ -2574,48 +2596,69 @@ async function buildCommitPayload(selectedDrafts, includeInit) {
 }
 
 async function doCommit(selectedIds, message, btn, includeInit) {
-  const draftsToSubmit = state.drafts.filter(d => selectedIds.includes(d.id));
+  let draftsToSubmit = state.drafts.filter(d => selectedIds.includes(d.id));
   btn.disabled = true;
   const oldText = btn.textContent;
   btn.textContent = '提交中…';
 
-  try {
-    progressStart('整理提交内容…');
-    const { textChanges, treeDeletes } = await buildCommitPayload(draftsToSubmit, includeInit);
-    if (!textChanges.length) { toastErr('内容与远端一致，无需提交'); btn.disabled = false; btn.textContent = oldText; progressEnd(); return; }
+  for (let attempt = 0; ; attempt++) {
+    try {
+      progressStart('整理提交内容…');
+      // 新增物料的编码在这里按远端最新数据分配
+      const prepared = await prepareDraftsWithCodes(draftsToSubmit);
+      const { textChanges, treeDeletes } = await buildCommitPayload(prepared, includeInit);
+      if (!textChanges.length) {
+        toastErr('内容与远端一致，无需提交');
+        btn.disabled = false;
+        btn.textContent = oldText;
+        progressEnd();
+        return;
+      }
 
-    const fallback = draftsToSubmit.length
-      ? `chore: Craft 系统提交（${draftsToSubmit.length} 项）`
-      : 'chore: 初始化数据仓库';
-    const result = await GH.singleCommit({
-      message: message || fallback,
-      baseCommit: state.remoteHead,
-      treeChanges: textChanges,
-      treeDeletes,
-      onProgress: (done, total, label) => progressSet(done, total, label),
-    });
+      const fallback = draftsToSubmit.length
+        ? `chore: Craft 系统提交（${draftsToSubmit.length} 项）`
+        : 'chore: 初始化数据仓库';
+      const result = await GH.singleCommit({
+        message: message || fallback,
+        baseCommit: state.remoteHead,
+        treeChanges: textChanges,
+        treeDeletes,
+        onProgress: (done, total, label) => progressSet(done, total, label),
+      });
 
-    // 清掉已提交的草稿
-    for (const d of draftsToSubmit) {
-      const [kind, id] = d.id.split(/:(.+)/);
-      await Store.removeDraft(kind, id);
-    }
-    toastOk(`已提交，commit ${result.commitSha.slice(0, 7)}`);
-    await refreshRemote();
-    await loadDrafts();
-    render();
-  } catch (e) {
-    btn.disabled = false;
-    btn.textContent = oldText;
-    if (e.code === 'CONFLICT') {
-      toastErr('远端已更新，已重新同步，请重新勾选提交');
+      // 清掉已提交的草稿
+      for (const d of draftsToSubmit) {
+        const [kind, id] = d.id.split(/:(.+)/);
+        await Store.removeDraft(kind, id);
+      }
+      toastOk(`已提交，commit ${result.commitSha.slice(0, 7)}`);
       await refreshRemote();
       await loadDrafts();
       render();
-    } else {
+      return;
+    } catch (e) {
+      // 别人先提交了：同步最新数据后重新分配编码并自动重试一次
+      if (e.code === 'CONFLICT' && attempt === 0) {
+        toast('远端已更新，正在重新同步并重试…');
+        await refreshRemote();
+        await loadDrafts();
+        draftsToSubmit = state.drafts.filter(d => selectedIds.includes(d.id));
+        if (!draftsToSubmit.length) {
+          btn.disabled = false;
+          btn.textContent = oldText;
+          progressEnd();
+          toastErr('草稿已不存在，请重新操作');
+          render();
+          return;
+        }
+        continue;
+      }
+      btn.disabled = false;
+      btn.textContent = oldText;
       progressEnd();
       toastErr('提交失败：' + (e.message || e));
       console.error(e);
+      return;
     }
   }
 }

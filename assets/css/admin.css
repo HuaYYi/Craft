@@ -578,14 +578,6 @@ table.grid td.plain { font-family: inherit; font-size: 13px; color: var(--text);
 .split-line { height: 1px; background: var(--border); margin: 12px 0; }
 
 /* ========= 数据仓库信息 ========= */
-.repo-chip {
-  display: inline-flex; align-items: center; gap: 6px;
-  height: 26px; padding: 0 10px;
-  border: 1px solid var(--border); border-radius: 999px;
-  background: var(--hover); color: var(--text-muted);
-  font-size: 12px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  white-space: nowrap; max-width: 240px; overflow: hidden; text-overflow: ellipsis;
-}
 .repo-summary {
   padding: 14px 16px; border: 1px solid var(--border); border-radius: var(--radius);
   background: var(--hover);
@@ -593,10 +585,6 @@ table.grid td.plain { font-family: inherit; font-size: 13px; color: var(--text);
 .repo-summary-name { font-size: 14px; font-weight: 600; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 .repo-summary-meta { margin-top: 6px; font-size: 12px; color: var(--text-muted); }
 .repo-actions { display: flex; gap: 10px; margin-top: 12px; }
-
-@media (max-width: 1100px) {
-  .repo-chip { display: none; }
-}
 
 /* ========= 导航角标 / 账号头像 ========= */
 .nav-badge {
