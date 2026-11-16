@@ -89,8 +89,10 @@ function todayPrefix() {
 }
 
 async function prepareDraftsWithCodes(drafts) {
+  // 只要还是临时编码就重新分配：新建后被编辑过的物料草稿会变成 update，不能只看 op
   const adds = drafts
-    .filter(d => d.kind === 'material' && d.op === 'add')
+    .filter(d => d.kind === 'material' && d.op !== 'delete')
+    .filter(d => { const code = String(d.data?.code || '').trim(); return !code || isTempCode(code); })
     .sort((a, b) => String(a.data?.createdAt || '').localeCompare(String(b.data?.createdAt || ''))
       || String(a.recordId).localeCompare(String(b.recordId)));
   if (!adds.length) return drafts;
@@ -106,7 +108,8 @@ async function prepareDraftsWithCodes(drafts) {
   };
   for (const code of used) bump(code);
   // 导入时自带编码的新物料保留原编码，只给空编码/临时编码的分配
-  for (const draft of adds) {
+  for (const draft of drafts) {
+    if (draft.kind !== 'material' || draft.op === 'delete') continue;
     const code = String(draft.data?.code || '').trim();
     if (code && !isTempCode(code)) { used.add(code); bump(code); }
   }
@@ -1352,7 +1355,9 @@ function openMaterialDialog(mat) {
             updatedAt: nowISO(),
             location: current.location === 'cloud' ? 'cloud' : 'local',
           };
-          await saveMaterialDraft(data, isNew ? 'add' : 'update');
+          // 还没提交过的新物料，编辑后仍是新增草稿，否则会丢掉「待分配编码」的状态
+          const existingDraft = draftOf('material', current.id);
+          await saveMaterialDraft(data, isNew || existingDraft?.op === 'add' ? 'add' : 'update');
           closeModal();
           render();
           toastOk('已存为草稿');
