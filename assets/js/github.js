@@ -43,6 +43,25 @@ function authHeaders(token) {
   };
 }
 
+// ---------- API 额度监控（GitHub 响应携带 x-ratelimit-* 头） ----------
+// remaining: 本小时剩余请求数；reset: 重置时间（epoch 秒）；localUsed: 本页面会话发出的请求数
+const quota = { limit: 5000, remaining: null, reset: null, localUsed: 0 };
+const quotaListeners = new Set();
+
+function trackQuota(res) {
+  const lim = res.headers.get('x-ratelimit-limit');
+  const rem = res.headers.get('x-ratelimit-remaining');
+  const rst = res.headers.get('x-ratelimit-reset');
+  if (lim !== null && Number(lim)) quota.limit = Number(lim);
+  if (rem !== null) quota.remaining = Number(rem);
+  if (rst !== null) quota.reset = Number(rst);
+  quota.localUsed += 1;
+  quotaListeners.forEach(fn => fn({ ...quota }));
+}
+
+export function getQuota() { return { ...quota }; }
+export function onQuota(fn) { quotaListeners.add(fn); return () => quotaListeners.delete(fn); }
+
 async function ghFetch(url, options = {}, token = getToken()) {
   const headers = {
     ...authHeaders(token),
@@ -50,6 +69,13 @@ async function ghFetch(url, options = {}, token = getToken()) {
   };
 
   const res = await fetch(url, { ...options, headers });
+  trackQuota(res);
+  if (res.status === 429) {
+    const err = new Error(`API 额度本小时已用完${quota.reset ? `，${formatReset(quota.reset)} 重置` : '，请稍后再试'}`);
+    err.status = 429;
+    err.reset = quota.reset;
+    throw err;
+  }
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     const err = new Error(`GitHub API ${res.status} ${res.statusText}: ${body.slice(0, 300)}`);
@@ -57,6 +83,11 @@ async function ghFetch(url, options = {}, token = getToken()) {
     throw err;
   }
   return res.json();
+}
+
+function formatReset(epochSec) {
+  const d = new Date(epochSec * 1000);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
 // ---------- base64 编解码（浏览器原生 btoa/atob 只支持 Latin1，用 UTF-8 版本） ----------

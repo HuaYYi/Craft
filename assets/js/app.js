@@ -144,6 +144,47 @@ init().catch(e => {
   toastErr('初始化失败：' + (e.message || e));
 });
 
+// API 额度显示：头像外圈进度环 + 下拉菜单里的详情
+function mountQuotaPill() {
+  const ring = document.getElementById('quotaRing');
+  const fill = document.getElementById('quotaRingFill');
+  if (!ring || !fill) return;
+
+  const paint = (q) => {
+    const pct = q.limit ? Math.max(0, Math.min(1, q.remaining / q.limit)) : 1;
+    fill.style.strokeDasharray = '100';
+    fill.style.strokeDashoffset = String(100 - pct * 100);
+    // 余量越低颜色越警示：≥30% 正常、10%~30% 琥珀、<10% 红
+    const level = pct < 0.1 ? 'critical' : pct < 0.3 ? 'warn' : 'ok';
+    // SVG 元素的 className 是只读的 SVGAnimatedString，必须用 setAttribute
+    ring.setAttribute('class', 'quota-ring ' + level);
+
+    const hm = q.reset ? formatClock(q.reset) : '';
+    const amount = q.remaining == null ? '…' : `${q.remaining} / ${q.limit}`;
+    const foot = q.remaining == null
+      ? '尚未发起请求'
+      : `本会话已请求 ${q.localUsed} 次${hm ? ` · ${hm} 重置` : ''}`;
+    const elAmount = document.getElementById('quotaAmount');
+    const elFill = document.getElementById('quotaFill');
+    const elFoot = document.getElementById('quotaFoot');
+    if (elAmount) elAmount.textContent = amount;
+    if (elFill) {
+      elFill.style.width = `${pct * 100}%`;
+      elFill.dataset.level = level;
+    }
+    if (elFoot) elFoot.textContent = foot;
+    const btn = document.getElementById('avatarBtn');
+    if (btn) btn.title = `${document.getElementById('accountName')?.textContent || ''}｜API 剩 ${amount}${hm ? ` · ${hm} 重置` : ''}`;
+  };
+  paint(GH.getQuota());
+  GH.onQuota(paint);
+}
+
+function formatClock(epochSec) {
+  const d = new Date(epochSec * 1000);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
 async function init() {
   if (!Auth.requireLogin()) return;
   state.user = Auth.getUser();
@@ -167,6 +208,7 @@ async function init() {
   bindAccountBar();
   bindGlobalMaterialSearch();
   bindInfoTips();
+  mountQuotaPill();
   await refreshRemote();
 
   if (localStorage.getItem(MODEL_KEY) !== MODEL_VERSION) {
@@ -211,7 +253,9 @@ function bindAccountBar() {
   document.getElementById('accountRepo').textContent =
     `数据仓库：${state.settings.owner}/${state.settings.repo} · ${state.settings.branch}`;
   if (avatar) {
-    avatar.textContent = displayName.slice(0, 1).toUpperCase();
+    const initial = document.getElementById('avatarInitial');
+    if (initial) initial.textContent = displayName.slice(0, 1).toUpperCase();
+    else avatar.textContent = displayName.slice(0, 1).toUpperCase();
     avatar.title = displayName;
     avatar.addEventListener('click', e => {
       e.stopPropagation();

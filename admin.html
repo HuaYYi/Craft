@@ -36,10 +36,21 @@
             <div class="global-search-results" id="globalMaterialSearchResults"></div>
           </div>
           <div class="account-menu">
-            <button class="avatar" id="avatarBtn" type="button"></button>
+            <button class="avatar" id="avatarBtn" type="button">
+              <span class="avatar-initial" id="avatarInitial"></span>
+              <svg class="quota-ring" id="quotaRing" viewBox="0 0 36 36" aria-hidden="true">
+                <circle class="ring-track" cx="18" cy="18" r="16.5" pathLength="100"></circle>
+                <circle class="ring-fill" id="quotaRingFill" cx="18" cy="18" r="16.5" pathLength="100"></circle>
+              </svg>
+            </button>
             <div class="account-dropdown" id="accountDropdown" hidden>
               <div class="account-name" id="accountName"></div>
               <div class="account-repo" id="accountRepo"></div>
+              <div class="quota-block">
+                <div class="quota-head"><span>API 额度</span><span id="quotaAmount">…</span></div>
+                <div class="quota-track"><div class="quota-fill" id="quotaFill"></div></div>
+                <div class="quota-foot" id="quotaFoot"></div>
+              </div>
               <button class="account-item" id="switchRepoBtn" type="button">切换数据仓库</button>
               <button class="account-item danger" id="menuLogoutBtn" type="button">退出登录</button>
             </div>
