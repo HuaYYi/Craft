@@ -46,6 +46,15 @@ export async function removeMeta(key) {
   const s = await tx('meta', 'readwrite');
   return reqToPromise(s.delete(key));
 }
+export async function listMeta(prefix) {
+  const s = await tx('meta', 'readonly');
+  const range = IDBKeyRange.bound(prefix, prefix + '\uffff');
+  const [keys, values] = await Promise.all([
+    reqToPromise(s.getAllKeys(range)),
+    reqToPromise(s.getAll(range)),
+  ]);
+  return keys.map((key, i) => ({ key, value: values[i] }));
+}
 
 // ---------- drafts ----------
 // 草稿对象结构：
@@ -83,6 +92,18 @@ export async function putDrafts(drafts) {
 export async function removeDraft(tableId, recordId) {
   const s = await tx('drafts', 'readwrite');
   return reqToPromise(s.delete(`${tableId}:${recordId}`));
+}
+export async function removeDrafts(tableId, recordIds) {
+  if (!recordIds.length) return;
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction('drafts', 'readwrite');
+    const store = transaction.objectStore('drafts');
+    for (const recordId of recordIds) store.delete(`${tableId}:${recordId}`);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error);
+  });
 }
 export async function clearDrafts() {
   const s = await tx('drafts', 'readwrite');

@@ -46,6 +46,10 @@ const state = {
   user: null,
   remoteHead: null,
   missingDataFiles: [],      // 数据仓库首次初始化时需要创建的文件
+  indexLoaded: false,        // 物料全局索引是否可展示（缓存或远端）
+  indexRefreshed: false,     // 本次会话是否已从远端刷新索引（提交前必须为 true）
+  indexPromise: null,        // 后台索引加载任务，提交等需要时等待
+  cacheNs: '',               // 文件缓存命名空间 owner/repo@branch
   // UI 状态
   selectedCategoryId: '', // '' = 未分组（含分组异常物料）；否则为分组 id
   activeTab: 'materials',
@@ -53,7 +57,7 @@ const state = {
   checked: new Set(),
   search: '',
   materialPage: 1,
-  materialPageSize: 50,
+  materialPageSize: 20,
   materialViewSeq: 0,
   dictChecked: new Set(),     // 字典设置页勾选
   setChecked: new Set(),      // 属性集合页勾选
@@ -313,6 +317,11 @@ function bindGlobalMaterialSearch() {
     resultsEl.innerHTML = '';
     matches = [];
     if (!keyword) { close(); return; }
+    if (!state.indexLoaded) {
+      resultsEl.classList.add('open');
+      resultsEl.appendChild(mk('div', { class: 'global-search-empty' }, '物料索引加载中…'));
+      return;
+    }
     matches = state.materials.filter(m =>
       String(m.code || '').toLowerCase().includes(keyword) ||
       String(m.name || '').toLowerCase().includes(keyword)
@@ -382,10 +391,15 @@ function render() {
 }
 
 // ---------- 远端读取 ----------
-async function refreshRemote() {
+// 首屏只等仓库校验、分支、设置文件和物料清单；全局索引体积大，随后台任务补上。
+const INDEX_CACHE_KEY = 'materials.index.v1';
+// 首屏快速索引缓存按仓库隔离，避免切换数据仓库后串数据
+const indexCacheKey = () => `${INDEX_CACHE_KEY}:${state.cacheNs}`;
+
+async function refreshRemote({ awaitIndex = false } = {}) {
   setLoading();
   progressStart('连接数据仓库…');
-  const totalSteps = 2 + DATA_SETS.length + 2;
+  const totalSteps = 3 + DATA_SETS.length;
   try {
     const texts = {};
     state.missingDataFiles = [];
@@ -408,18 +422,21 @@ async function refreshRemote() {
       throw e;
     }
 
-    // 分支、三个设置文件、物料清单与搜索索引并行读取，减少串行往返
-    const [head, files, materialData] = await Promise.all([
-      GH.getBranchHead(state.settings.branch)
-        .catch(() => null)
-        .then(sha => { progressAdvance('读取分支…'); return sha; }),
+    // 先取分支 HEAD：它决定本地文件缓存是否还有效，之后的文件读取都先查缓存
+    const head = await GH.getBranchHead(state.settings.branch).catch(() => null);
+    progressAdvance('读取分支…');
+    const ns = `${state.settings.owner}/${state.settings.repo}@${state.settings.branch}`;
+    state.cacheNs = ns;
+    GH.setCacheContext(ns, head);
+
+    // 三个设置文件、物料清单并行读取；head 未变时直接命中 IndexedDB 缓存，不再下载
+    const [files, materialData] = await Promise.all([
       Promise.all(DATA_SETS.map(s => GH.getFile(s.path).then(f => {
         progressAdvance('读取数据…');
         return f;
       }))),
-      MaterialStore.loadRemote().then(data => {
+      MaterialStore.loadManifest().then(data => {
         progressAdvance('读取物料清单…');
-        progressAdvance('读取搜索索引…');
         return data;
       }),
     ]);
@@ -435,14 +452,50 @@ async function refreshRemote() {
       state[s.base] = texts[s.kind] ? safeParse(texts[s.kind], []) : [];
       state[s.raw] = texts[s.kind] || null;
     }
-    state.baseMaterials = materialData.materials;
     state.missingDataFiles.push(...materialData.missingPaths);
+
+    // 上次成功加载的索引先顶上，首屏就能看到计数，不必等大文件下载
+    if (!state.indexLoaded) {
+      const cached = await Store.getMeta(indexCacheKey()).catch(() => null);
+      if (Array.isArray(cached) && cached.length) {
+        state.baseMaterials = cached;
+        state.indexLoaded = true;
+      }
+    }
   } catch (e) {
     console.warn('远端读取失败', e);
     state.missingDataFiles = [];
     toastErr('数据仓库读取失败：' + (e.message || e));
   } finally {
     progressEnd();
+  }
+
+  state.indexPromise = loadMaterialIndex();
+  if (awaitIndex) await state.indexPromise;
+}
+
+// 后台加载全局索引：到达后合并计数、启用全局搜索，并写入本地缓存供下次首屏使用
+async function loadMaterialIndex() {
+  try {
+    const data = await MaterialStore.loadIndex();
+    state.baseMaterials = data.materials;
+    state.indexLoaded = true;
+    state.indexRefreshed = true;
+    state.missingDataFiles = [
+      ...state.missingDataFiles.filter(p => p !== CONFIG.materialsSearchIndexPath),
+      ...data.missingPaths,
+    ];
+    Store.setMeta(indexCacheKey(), data.materials).catch(e => console.warn('缓存物料索引失败', e));
+    await autoFixLooseMaterials();
+    await loadDrafts();
+    // 弹窗打开时可能正在编辑，先不重绘背景；关闭后其他操作会重新渲染
+    if (state.view === 'materials' && document.getElementById('modalMask')?.classList.contains('hidden')) render();
+    else if (state.view === 'commit') render();
+  } catch (e) {
+    console.warn('物料索引加载失败', e);
+    if (state.indexLoaded) toast('物料索引刷新失败，当前显示上次缓存的数据', 'warn', 4000);
+    else toastErr('物料索引加载失败：' + (e.message || e));
+    if (state.view === 'materials') render();
   }
 }
 
@@ -475,6 +528,8 @@ function applyDrafts() {
         categoryId: d.data.categoryId || '',
         code: d.data.code || '',
         name: d.data.name || '',
+        updatedAt: d.data.updatedAt || d.data.createdAt || '',
+        updatedBy: d.data.updatedBy || '',
         path: previous?.path || '',
       };
       if (idx >= 0) materials[idx] = summary;
@@ -523,7 +578,7 @@ async function saveCategoryDraft(cat, op) {
   await loadDrafts();
 }
 
-async function saveMaterialDraft(mat, op) {
+function makeMaterialDraft(mat, op) {
   const who = state.user?.name || state.user?.login || '';
   const next = {
     ...mat,
@@ -532,13 +587,17 @@ async function saveMaterialDraft(mat, op) {
     createdBy: mat.createdBy || (op === 'add' ? who : ''),
     updatedBy: who || mat.updatedBy || '',
   };
-  await Store.putDraft({
+  return {
     id: `material:${next.id}`,
     kind: 'material',
     recordId: next.id,
     op,
     data: clone(next),
-  });
+  };
+}
+
+async function saveMaterialDraft(mat, op) {
+  await Store.putDraft(makeMaterialDraft(mat, op));
   await loadDrafts();
 }
 
@@ -569,12 +628,12 @@ function draftOf(kind, id) {
   return state.drafts.find(d => d.kind === kind && d.recordId === id) || null;
 }
 
-async function hydrateMaterials(entries) {
+async function hydrateMaterials(entries, onProgress) {
   const remoteEntries = entries.filter(entry => {
     const draft = draftOf('material', entry.id);
     return !draft || draft.op === 'delete';
   });
-  const remote = await MaterialStore.hydrate(remoteEntries);
+  const remote = await MaterialStore.hydrate(remoteEntries, onProgress);
   const byId = new Map(remote.map(item => [item.id, item]));
   return entries.map(entry => {
     const draft = draftOf('material', entry.id);
@@ -617,7 +676,7 @@ function buildTreePanel() {
     else if (draft.op === 'delete' && state.baseMaterials.some(item => item.id === draft.recordId)) totalMaterials -= 1;
   }
   ttl.appendChild(mk('span', { class: 'tree-total', style: 'margin-left:6px;font-size:12px;color:var(--text-muted);font-weight:400;' },
-    String(totalMaterials)));
+    state.indexLoaded ? String(totalMaterials) : '…'));
   head.appendChild(ttl);
   const addBtn = mk('button', { class: 'btn small', title: '新建分组', 'aria-label': '新建分组' }, '＋');
   addBtn.addEventListener('click', () => openCategoryDialog(null));
@@ -632,7 +691,7 @@ function buildTreePanel() {
   tree.appendChild(buildTreeNode({
     depth: 0,
     label: '未分组',
-    count: ungroupedCount,
+    count: state.indexLoaded ? ungroupedCount : '…',
     active: state.selectedCategoryId === UNGROUPED,
     isRoot: true,
     onClick: () => { state.selectedCategoryId = UNGROUPED; state.activeTab = 'materials'; state.materialPage = 1; state.checked.clear(); render(); },
@@ -650,7 +709,7 @@ function buildTreePanel() {
         parentId: node.parentId ?? null,
         depth,
         label: node.name,
-        count,
+        count: state.indexLoaded ? count : '…',
         active: state.selectedCategoryId === node.id,
         hasKids,
         isOpen,
@@ -881,6 +940,8 @@ async function currentMaterialSummaries() {
           categoryId: draft.data.categoryId || '',
           code: draft.data.code || '',
           name: draft.data.name || '',
+          updatedAt: draft.data.updatedAt || draft.data.createdAt || '',
+          updatedBy: draft.data.updatedBy || '',
           path: base?.path || '',
         });
       }
@@ -910,6 +971,8 @@ async function currentMaterialSummaries() {
         categoryId,
         code: draft.data.code || '',
         name: draft.data.name || '',
+        updatedAt: draft.data.updatedAt || draft.data.createdAt || '',
+        updatedBy: draft.data.updatedBy || '',
         path: base?.path || '',
       });
     }
@@ -926,9 +989,9 @@ async function currentMaterialSummaries() {
     String(a.code || '').localeCompare(String(b.code || ''), 'zh', { numeric: true }));
 }
 
-async function currentMaterials() {
+async function currentMaterials(onProgress) {
   const summaries = await currentMaterialSummaries();
-  return hydrateMaterials(summaries);
+  return hydrateMaterials(summaries, onProgress);
 }
 
 function buildMaterialsPanel(cat) {
@@ -1019,6 +1082,14 @@ async function renderMaterialsTable(panel, cat) {
   wrap.appendChild(mk('div', { class: 'empty', style: 'padding:24px;' }, '加载中…'));
   if (pagination) pagination.innerHTML = '';
 
+  // 全局索引尚未就绪时不发分片请求，等后台加载完成后由 loadMaterialIndex 重绘
+  if (!state.indexLoaded) {
+    wrap.innerHTML = '';
+    wrap.appendChild(mk('div', { class: 'empty', style: 'padding:24px;' }, '物料索引加载中…'));
+    if (info) info.textContent = '正在加载物料索引…';
+    return;
+  }
+
   let summaries;
   let list;
   let totalPages;
@@ -1028,7 +1099,8 @@ async function renderMaterialsTable(panel, cat) {
     totalPages = Math.max(1, Math.ceil(summaries.length / state.materialPageSize));
     state.materialPage = Math.min(Math.max(1, state.materialPage), totalPages);
     const start = (state.materialPage - 1) * state.materialPageSize;
-    list = await hydrateMaterials(summaries.slice(start, start + state.materialPageSize));
+    // 列表只用索引摘要渲染；完整档案在编辑、导出、批量操作时再按分片加载
+    list = summaries.slice(start, start + state.materialPageSize);
   } catch (e) {
     if (seq === state.materialViewSeq) {
       wrap.innerHTML = '';
@@ -1069,33 +1141,19 @@ async function renderMaterialsTable(panel, cat) {
     render();
   });
 
-  // 属性列覆盖当前筛选结果，完整属性值仍只加载当前页。
-  const attrDefs = [];
-  const seenKeys = new Set();
-  for (const m of summaries) {
-    if (!m.categoryId) continue;
-    const cat = Cat.findCategory(state.categories, m.categoryId);
-    for (const def of fieldsOf(attrsOf(cat))) {
-      if (!seenKeys.has(def.key)) { seenKeys.add(def.key); attrDefs.push(def); }
-    }
-  }
-
-  // 属性列覆盖当前筛选结果；未分组固定不显示属性列和分组列
-  const attrCols = state.selectedCategoryId === UNGROUPED ? [] : attrDefs;
+  // 摘要里没有属性值，列表只保留固定列；属性在编辑弹窗里查看和修改
   const thChk = mk('th', { class: 'col-chk' });
   thChk.appendChild(chkAll);
   head.appendChild(thChk);
-  const headLabels = ['物料编码', '物料名称',
-    ...attrCols.map(d => d.label), '保存状态', '最近编辑时间', '编辑人'];
-  const headClasses = ['col-code', 'col-name',
-    ...attrCols.map(() => 'col-attr'), 'col-attr', 'col-attr', 'col-attr'];
+  const headLabels = ['物料编码', '物料名称', '保存状态', '最近编辑时间', '编辑人'];
+  const headClasses = ['col-code', 'col-name', 'col-attr', 'col-attr', 'col-attr'];
   headLabels.forEach((t, i) => head.appendChild(mk('th', { class: headClasses[i] }, t)));
   head.appendChild(mk('th', { class: 'col-ops' }, '操作'));
   table.appendChild(head);
 
   if (!list.length) {
     const tr = mk('tr');
-    tr.appendChild(mk('td', { colspan: attrCols.length + 7, class: 'empty' }, '暂无物料'));
+    tr.appendChild(mk('td', { colspan: 7, class: 'empty' }, '暂无物料'));
     table.appendChild(tr);
   }
 
@@ -1115,15 +1173,12 @@ async function renderMaterialsTable(panel, cat) {
 
     tr.appendChild(mk('td', { class: 'col-code' + (isTempCode(m.code) ? ' muted' : '') }, m.code || '待提交'));
     tr.appendChild(mk('td', { class: 'col-name' }, m.name || ''));
-    for (const def of attrCols) {
-      tr.appendChild(mk('td', { class: 'wrap col-attr' }, Cat.fmtAttrValue(def, m.attrs?.[def.key])));
-    }
     const locTd = mk('td', { class: 'col-attr' });
     locTd.appendChild(buildLocationCell(m));
     tr.appendChild(locTd);
 
     const editTd = mk('td', { class: 'muted col-attr', style: 'font-size:12px;' },
-      fmtTime(m.updatedAt || m.createdAt));
+      fmtTime(m.updatedAt));
     tr.appendChild(editTd);
 
     const byTd = mk('td', { class: 'muted col-attr', style: 'font-size:12px;' }, m.updatedBy || '—');
@@ -1131,7 +1186,19 @@ async function renderMaterialsTable(panel, cat) {
 
     const opsTd = mk('td', { class: 'col-ops' });
     const editBtn = mk('button', { class: 'link-btn' }, '编辑');
-    editBtn.addEventListener('click', () => openMaterialDialog(m));
+    // 行里只有摘要，打开编辑弹窗时才按分片加载完整档案
+    editBtn.addEventListener('click', async () => {
+      if (editBtn.disabled) return;
+      editBtn.disabled = true;
+      try {
+        const full = await getMaterialById(m.id);
+        if (full) openMaterialDialog(full);
+      } catch (e) {
+        toastErr('物料加载失败：' + (e.message || e));
+      } finally {
+        editBtn.disabled = false;
+      }
+    });
     const delBtn = mk('button', { class: 'link-btn danger' }, '删除');
     delBtn.addEventListener('click', () => doDeleteMaterial(m));
     opsTd.appendChild(editBtn);
@@ -1452,6 +1519,11 @@ function openBatchMoveDialog() {
       .sort((a, b) => a.label.localeCompare(b.label, 'zh')));
   const picker = buildCategoryPicker(opts, UNGROUPED);
   body.appendChild(picker.el);
+  // 没有末级分组时弹窗会只剩“未分组”，直接说明原因和去处
+  if (!leaves.length) {
+    body.appendChild(mk('div', { class: 'muted', style: 'margin-top:10px;font-size:12px;color:var(--danger);' },
+      '当前没有末级分组：物料只能挂到末级分组。请先在左侧选中分组，到「分组管理」勾选「末级分组」，再回来转移。'));
+  }
 
   openModal({
     title: '批量转移分组',
@@ -1462,16 +1534,26 @@ function openBatchMoveDialog() {
         label: '确认转移', className: 'primary',
         onClick: async () => {
           const target = picker.value;
-          for (const id of ids) {
-            const m = await getMaterialById(id);
-            if (!m) continue;
-            const d = draftOf('material', id);
-            const op = d?.op === 'add' ? 'add' : 'update';
-            await saveMaterialDraft({ ...m, categoryId: target, updatedAt: nowISO() }, op);
+          const summaries = ids.map(id => state.materials.find(item => item.id === id)).filter(Boolean);
+          progressStart('加载物料分片…');
+          try {
+            const materials = await hydrateMaterials(summaries,
+              (done, total) => progressSet(done, total, '加载物料分片'));
+            const drafts = materials.map(m => {
+              const d = draftOf('material', m.id);
+              const op = d?.op === 'add' ? 'add' : 'update';
+              return makeMaterialDraft({ ...m, categoryId: target, updatedAt: nowISO() }, op);
+            });
+            await Store.putDrafts(drafts);
+            await loadDrafts();
+            closeModal();
+            render();
+            toastOk(`已转移 ${ids.length} 条物料`);
+          } catch (e) {
+            toastErr('批量转移失败：' + (e.message || e));
+          } finally {
+            progressEnd();
           }
-          closeModal();
-          render();
-          toastOk(`已转移 ${ids.length} 条物料`);
         },
       },
     ],
@@ -1482,23 +1564,36 @@ async function doBatchDelete() {
   const ids = Array.from(state.checked);
   if (!ids.length) { toastErr('请先勾选物料'); return; }
   if (!(await confirm(`确定删除选中的 ${ids.length} 条物料？`))) return;
-  for (const id of ids) {
-    const m = await getMaterialById(id);
-    if (!m) continue;
-    const d = draftOf('material', id);
-    if (d?.op === 'add') await Store.removeDraft('material', id);
-    else await saveMaterialDraft({ ...m }, 'delete');
+  const summaries = ids.map(id => state.materials.find(item => item.id === id)).filter(Boolean);
+  progressStart('加载物料分片…');
+  try {
+    const materials = await hydrateMaterials(summaries,
+      (done, total) => progressSet(done, total, '加载物料分片'));
+    const drafts = [];
+    const addedIds = [];
+    for (const m of materials) {
+      const d = draftOf('material', m.id);
+      if (d?.op === 'add') addedIds.push(m.id);
+      else drafts.push(makeMaterialDraft({ ...m }, 'delete'));
+    }
+    await Store.putDrafts(drafts);
+    await Store.removeDrafts('material', addedIds);
+    state.checked.clear();
+    await loadDrafts();
+    render();
+    toastOk(`已删除 ${ids.length} 条（草稿）`);
+  } catch (e) {
+    toastErr('批量删除失败：' + (e.message || e));
+  } finally {
+    progressEnd();
   }
-  state.checked.clear();
-  await loadDrafts();
-  render();
-  toastOk(`已删除 ${ids.length} 条（草稿）`);
 }
 
 // ---------- Excel 导入导出 ----------
 async function doExport() {
+  progressStart('加载物料分片…');
   try {
-    const list = await currentMaterials();
+    const list = await currentMaterials((done, total) => progressSet(done, total, '加载物料分片'));
     if (!list.length) { toastErr('当前没有可导出的物料'); return; }
     // 物料位置按同步状态推导：有未提交草稿=本地
     const rows = list.map(m => ({ ...m, location: draftOf('material', m.id) ? 'local' : 'cloud' }));
@@ -1506,6 +1601,8 @@ async function doExport() {
     toastOk(`已导出 ${n} 条物料`);
   } catch (e) {
     toastErr('导出失败：' + (e.message || e));
+  } finally {
+    progressEnd();
   }
 }
 
@@ -2694,9 +2791,14 @@ async function rebuildSearchIndex(btn) {
     const payload = await MaterialStore.rebuildSearchIndex(ids, (done, total) => progressSet(done, total, '扫描分组'));
     if (!payload.total) { toastErr('分片里没有找到任何物料'); return; }
     progressStart('写入搜索索引…');
-    await GH.singleCommit({ message: 'chore: 重建搜索索引', treeChanges: payload.fileChanges, treeDeletes: payload.treeDeletes });
+    const result = await GH.singleCommit({
+      message: 'chore: 重建搜索索引',
+      baseCommit: state.remoteHead,
+      treeChanges: payload.fileChanges,
+      treeDeletes: payload.treeDeletes,
+    });
+    await applyCommittedPayload(payload, result.commitSha);
     toastOk(`已重建搜索索引（${payload.total} 条）`);
-    await refreshRemote();
     render();
   } catch (e) {
     toastErr(e.message || '重建失败');
@@ -2764,10 +2866,53 @@ async function buildCommitPayload(selectedDrafts, includeInit) {
   };
 }
 
+// 提交已经落库：以本次 payload 为新基准，保留未提交草稿，并同步新 head 下的缓存。
+async function applyCommittedPayload(payload, commitSha) {
+  const oldHead = state.remoteHead;
+  state.remoteHead = commitSha;
+  GH.setCacheContext(state.cacheNs, commitSha);
+  await GH.applyCommitToCache(oldHead, payload);
+
+  const changes = new Map(payload.fileChanges.map(change => [change.path, change]));
+  for (const s of DATA_SETS) {
+    const change = changes.get(s.path);
+    if (!change) continue;
+    state[s.raw] = change.content;
+    state[s.base] = safeParse(change.content, []);
+  }
+
+  state.baseMaterials = await MaterialStore.applyCommitPayload(payload);
+  state.indexLoaded = true;
+  state.indexRefreshed = true;
+  const written = new Set(payload.fileChanges.map(change => change.path));
+  state.missingDataFiles = state.missingDataFiles.filter(path => !written.has(path));
+  await Store.setMeta(indexCacheKey(), state.baseMaterials).catch(e => console.warn('缓存物料索引失败', e));
+  await loadDrafts();
+  await autoFixLooseMaterials();
+}
+
 async function doCommit(selectedIds, message, btn, includeInit) {
   let draftsToSubmit = state.drafts.filter(d => selectedIds.includes(d.id));
   btn.disabled = true;
   const oldText = btn.textContent;
+
+  // 索引还在后台加载时先等它，避免拿旧/空索引生成提交内容
+  if (!state.indexRefreshed) {
+    btn.textContent = '等待物料索引…';
+    await state.indexPromise?.catch(() => {});
+    // 后台加载失败过一次时，提交前再试一次
+    if (!state.indexRefreshed) {
+      state.indexPromise = loadMaterialIndex();
+      await state.indexPromise.catch(() => {});
+    }
+  }
+  if (!state.indexRefreshed) {
+    toastErr('物料索引尚未加载完成，请稍候再提交');
+    btn.disabled = false;
+    btn.textContent = oldText;
+    return;
+  }
+
   btn.textContent = '提交中…';
 
   for (let attempt = 0; ; attempt++) {
@@ -2800,16 +2945,16 @@ async function doCommit(selectedIds, message, btn, includeInit) {
         const [kind, id] = d.id.split(/:(.+)/);
         await Store.removeDraft(kind, id);
       }
+      await applyCommittedPayload({ fileChanges, treeDeletes }, result.commitSha);
+      progressEnd();
       toastOk(`已提交，commit ${result.commitSha.slice(0, 7)}`);
-      await refreshRemote();
-      await loadDrafts();
       render();
       return;
     } catch (e) {
       // 别人先提交了：同步最新数据后重新分配编码并自动重试一次
       if (e.code === 'CONFLICT' && attempt === 0) {
         toast('远端已更新，正在重新同步并重试…');
-        await refreshRemote();
+        await refreshRemote({ awaitIndex: true });
         await loadDrafts();
         draftsToSubmit = state.drafts.filter(d => selectedIds.includes(d.id));
         if (!draftsToSubmit.length) {

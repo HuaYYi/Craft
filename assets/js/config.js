@@ -12,7 +12,9 @@ export const CONFIG = {
   materialsSearchIndexPath: 'data/materials/search-index.json.gz',
   legacySearchIndexPath: 'data/materials/search-index.json', // 旧格式，读到后会在下次提交时迁移并删除
   legacyMaterialsPath: 'data/materials.json',
-  materialChunkSize: 500,
+  // 分片按字节装填：约 500KB 封片；修改导致整片超过 800KB 时在提交阶段强制拆分
+  materialChunkBytes: 500 * 1024,
+  materialChunkMaxBytes: 800 * 1024,
   dictionariesPath: 'data/dictionaries.json',
   attrSetsPath: 'data/attrSets.json',
 

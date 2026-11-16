@@ -5,6 +5,30 @@
 
 import { CONFIG, LS_KEYS } from './config.js';
 import { getToken } from './auth.js';
+import * as Store from './store.js';
+
+// ---------- 文件缓存（IndexedDB + head sha） ----------
+// 同一仓库同一分支：head 不变说明任何文件都没变，直接用缓存；head 变了整批缓存自然失效。
+let cacheNs = '';    // owner/repo@branch
+let cacheHead = '';  // 远端分支 HEAD commit sha；为空则不启用缓存
+
+export function setCacheContext(ns, head) {
+  cacheNs = ns || '';
+  cacheHead = head || '';
+}
+
+const fileCacheKey = (path) => `file:${cacheNs}:${path}`;
+
+async function readFileCache(key) {
+  try {
+    const hit = await Store.getMeta(key);
+    return hit && hit.head === cacheHead ? hit : null;
+  } catch (_) { return null; }
+}
+
+async function writeFileCache(key, value) {
+  try { await Store.setMeta(key, { head: cacheHead, ...value }); } catch (_) { /* 缓存失败不影响读取 */ }
+}
 
 // ---------- 工具 ----------
 
@@ -116,6 +140,43 @@ export function bytesToBase64(bytes) {
   }
   return btoa(binary);
 }
+export function bytesFromBase64(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+// 自己的提交成功后，未变更文件的旧 head 缓存仍可沿用；变更文件直接用 payload 覆盖。
+// 变更路径不参与重标记，即使缓存写入失败也只会重新下载，不会读到旧内容。
+export async function applyCommitToCache(oldHead, { fileChanges = [], treeDeletes = [] }) {
+  if (!cacheNs || !cacheHead) return;
+  const prefix = `file:${cacheNs}:`;
+  const touched = new Set([...fileChanges, ...treeDeletes].map(item => item.path));
+  if (oldHead && oldHead !== cacheHead) {
+    try {
+      const entries = await Store.listMeta(prefix);
+      await Promise.all(entries
+        .filter(({ key, value }) => value?.head === oldHead && !touched.has(key.slice(prefix.length)))
+        .map(({ key, value }) => Store.setMeta(key, { ...value, head: cacheHead })));
+    } catch (_) { /* 重标记失败只会导致下次重新下载 */ }
+  }
+
+  for (const change of fileChanges) {
+    const key = fileCacheKey(change.path);
+    if (typeof change.content === 'string') {
+      await writeFileCache(key, { text: change.content });
+    } else if (typeof change.base64 === 'string') {
+      await writeFileCache(key, { bytes: bytesFromBase64(change.base64) });
+    } else {
+      // 只有 blob sha 时本地没有内容，清除旧缓存，之后按需下载。
+      await Store.removeMeta(key).catch(() => {});
+    }
+  }
+  for (const { path } of treeDeletes) {
+    await writeFileCache(fileCacheKey(path), { missing: true });
+  }
+}
 
 // ---------- 读取 ----------
 
@@ -131,14 +192,20 @@ export async function getCommit(sha) {
   return ghFetch(apiUrl(`/git/commits/${sha}`));
 }
 
-// 取 tree（recursive 拿完整文件列表）
-export async function getTree(sha, recursive = true) {
-  return ghFetch(apiUrl(`/git/trees/${sha}${recursive ? '?recursive=1' : ''}`));
-}
-
 // 通过 contents API 取文件；文件过大（>1MB 会返回 403）或接口异常时降级用 raw
 // 返回 { content: 解码后的文本, sha: 文件 blob sha（raw 降级时为 null）, encoding }
 export async function getFile(path) {
+  if (!cacheNs || !cacheHead) return getFileRemote(path);
+  const key = fileCacheKey(path);
+  const hit = await readFileCache(key);
+  if (hit) return hit.missing ? null : { content: hit.text, sha: hit.sha || null, encoding: 'utf8' };
+  const file = await getFileRemote(path);
+  // 404 也缓存，避免每次打开都对不存在的文件再请求一次
+  await writeFileCache(key, file ? { text: file.content, sha: file.sha || null } : { missing: true });
+  return file;
+}
+
+async function getFileRemote(path) {
   const { owner, repo, branch } = getRepoSettings();
   try {
     const data = await ghFetch(
@@ -163,6 +230,20 @@ export async function getFile(path) {
 // 取二进制文件（如 gzip 搜索索引）：按 raw 字节读取，避免 base64 文本解码破坏内容
 // 返回 { bytes: Uint8Array }；文件不存在返回 null
 export async function getFileBinary(path) {
+  if (!cacheNs || !cacheHead) return getFileBinaryRemote(path);
+  const key = fileCacheKey(path);
+  const hit = await readFileCache(key);
+  if (hit) return hit.missing ? null : { bytes: hit.bytes };
+  const file = await getFileBinaryRemote(path);
+  if (file) {
+    await writeFileCache(key, { bytes: file.bytes });
+  } else {
+    await writeFileCache(key, { missing: true });
+  }
+  return file;
+}
+
+async function getFileBinaryRemote(path) {
   const { owner, repo, branch } = getRepoSettings();
   const res = await fetch(
     `${CONFIG.apiBase}/repos/${owner}/${repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${branch}`,
@@ -279,21 +360,11 @@ export async function singleCommit({ message, baseCommit, treeChanges, treeDelet
     return { path: change.path, sha, mode: change.mode || '100644', type: 'blob' };
   }));
 
-  // 3. 构建新 tree —— 基于 base.tree.sha，用 tree API 的 base_tree 参数让它做增量
-  // 对删除的路径：先拿完整 tree，过滤掉要删的 path，再把新增/修改条目覆盖进去
-  const fullTree = await getTree(base.tree.sha, true);
-  const deleteSet = new Set(treeDeletes.map(d => d.path));
-
-  const filtered = fullTree.tree.filter(item => {
-    // 只保留 blob，跳过 submodule/commit；删除集合命中的去掉
-    if (item.type !== 'blob') return false;
-    if (deleteSet.has(item.path)) return false;
-    // 如果这个路径在本次改动里，会被新条目覆盖，这里先删掉旧的
-    if (changes.some(c => c.path === item.path)) return false;
-    return true;
-  });
-
-  const newTreeEntries = [...filtered, ...createdBlobs];
+  // 3. 基于 base.tree.sha 增量构建 tree，只提交变更条目；sha:null 表示删除路径。
+  const newTreeEntries = [
+    ...createdBlobs,
+    ...treeDeletes.map(({ path }) => ({ path, mode: '100644', type: 'blob', sha: null })),
+  ];
 
   const newTree = await ghFetch(
     `${CONFIG.apiBase}/repos/${owner}/${repo}/git/trees`,

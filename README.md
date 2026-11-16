@@ -53,7 +53,7 @@ data/attrSets.json             属性集合数据
 data/materials/manifest.json   物料清单
 data/materials/search-index.json.gz  全局轻量搜索索引（紧凑结构 + gzip）
 data/materials/categories/<分类>/index.json  分类索引
-data/materials/categories/<分类>/page-000001.json  完整物料分片（每片最多 500 条）
+data/materials/categories/<分类>/page-<id>.json  完整物料分片（按约 500KB 动态装片，ID 无序）
 ```
 
 ## 数据结构
@@ -76,11 +76,20 @@ data/materials/categories/<分类>/page-000001.json  完整物料分片（每片
    "attrs":[{"key":"voltage","label":"电压","type":"number"},{"key":"use","label":"用途","type":"text"}] }]
 
 // materials（数据仓库 data/materials/ 下按分类分片；attrs 只存末级分组的生效字段值）
-// manifest.json : { "version":1, "chunkSize":500, "total":0 }
+// manifest.json : { "version":1, "chunkBytes":512000, "chunkMaxBytes":819200, "total":0 }
+//   分片按序列化字节装填，约 500KB 封片；修改导致整片超过 800KB 时在提交阶段拆成多片
+//   删除/修改空出空间的分片会被复用：新物料优先填入能装下的最满分片，而不是只追加到最后一片
+//   分片 ID 无序且只增不复用，展示顺序由分类索引里的记录顺序决定
+// categories/<分类>/index.json : { "categoryId":"c_x", "seq":0,
+//   "chunks":[{"path":".../page-a3f9b72e.json","bytes":198633}], "records":[摘要...] }
+//   chunks 记录每个分片的字节数，用于复用空闲空间；旧的字符串路径格式仍兼容，
+//   被读写过的分片会补上 bytes，未读写的老分片暂不参与复用（懒迁移）
 // search-index.json.gz : 紧凑结构 + gzip
-//   { "v":2, "cats":["c_leaf"], "items":[[0, 1, "m_x", "202610270001", "110kV 配电变压器"]] }
-//   items 每行 = [分类下标, 分片页码, id, code, name]；分片路径由分类 id + 页码推导
-//   仍兼容读取旧的 search-index.json 数组，下次提交时自动迁移并删除旧文件
+//   { "v":3, "cats":["c_leaf"],
+//     "items":[[0, "a3f9b72e", "m_x", "202610270001", "110kV 配电变压器", "2026-10-27T08:00:00Z", "张三"]] }
+//   items 每行 = [分类下标, 分片 ID, id, code, name, updatedAt, updatedBy]；分片路径由分类 id + 分片 ID 推导
+//   列表页直接用摘要渲染（每页 20 条），编辑/导出时才按分片加载完整档案
+//   仍兼容读取 v2（无 updatedAt/updatedBy）、旧 search-index.json 数组和数字页码，下次提交时自动迁移
 // 分片文件 : [{ "id":"m_x", "categoryId":"c_leaf", "code":"...", "name":"...",
 //              "attrs":{}, "location":"cloud", "syncedAt":"...",
 //              "createdAt":"...", "updatedAt":"...", "createdBy":"", "updatedBy":"" }]

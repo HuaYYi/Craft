@@ -3,7 +3,12 @@ import { CONFIG } from './config.js';
 import * as GH from './github.js';
 
 const clone = (v) => JSON.parse(JSON.stringify(v));
-const defaultManifest = () => ({ version: 1, chunkSize: CONFIG.materialChunkSize, total: 0 });
+const defaultManifest = () => ({
+  version: 1,
+  chunkBytes: CONFIG.materialChunkBytes,
+  chunkMaxBytes: CONFIG.materialChunkMaxBytes,
+  total: 0,
+});
 const defaultCategory = (categoryId) => ({ categoryId: categoryId || '', seq: 0, chunks: [], records: [] });
 
 let manifest = defaultManifest();
@@ -15,6 +20,31 @@ let manifestExisted = false;
 const shardCache = new Map();
 const categoryCache = new Map();
 
+const encoder = new TextEncoder();
+const jsonBytes = (value) => encoder.encode(JSON.stringify(value)).length;
+
+function shardPathOf(categoryId, shardId) {
+  return `${CONFIG.materialsRoot}/categories/${categoryKey(categoryId)}/page-${shardId}.json`;
+}
+
+function shardIdOf(path) {
+  const match = /\/page-([^/]+)\.json$/.exec(path || '');
+  return match ? match[1] : '';
+}
+
+// 分类索引的 chunks 统一成 { path, bytes }；旧格式是字符串路径，bytes 未知（null）
+function normalizeChunks(chunks) {
+  return (Array.isArray(chunks) ? chunks : []).map(chunk => {
+    if (typeof chunk === 'string') return { path: chunk, bytes: null };
+    if (!chunk || typeof chunk !== 'object' || !chunk.path) return null;
+    const bytes = Number(chunk.bytes);
+    return { path: chunk.path, bytes: Number.isFinite(bytes) ? bytes : null };
+  }).filter(Boolean);
+}
+
+const chunkPathOf = (chunk) => (typeof chunk === 'string' ? chunk : (chunk?.path || ''));
+
+
 function compareCode(a, b) {
   return String(a.code || '').localeCompare(String(b.code || ''), 'zh', { numeric: true });
 }
@@ -25,14 +55,17 @@ function summaryOf(data, path) {
     categoryId: data.categoryId || '',
     code: data.code || '',
     name: data.name || '',
+    updatedAt: data.updatedAt || data.createdAt || '',
+    updatedBy: data.updatedBy || '',
     path: path || data.path || '',
   };
 }
 
 // ---------- 搜索索引：紧凑结构 + gzip ----------
-// 磁盘格式：{"v":2,"cats":["c_a",...],"items":[[catIdx,page,id,code,name],...]}
-// 读取时展开成原有 { id, categoryId, code, name, path }，上层逻辑无需改动。
-const INDEX_VERSION = 2;
+// 磁盘格式：{"v":3,"cats":["c_a",...],"items":[[catIdx,page,id,code,name,updatedAt,updatedBy],...]}
+// 读取时展开成 { id, categoryId, code, name, updatedAt, updatedBy, path }，
+// 列表页直接用摘要渲染，不再为每页下载完整分片。
+const INDEX_VERSION = 3;
 
 function compactIndex(items) {
   const cats = [];
@@ -44,8 +77,11 @@ function compactIndex(items) {
       catIdx.set(categoryId, cats.length);
       cats.push(categoryId);
     }
-    const match = /page-(\d+)\.json$/.exec(item.path || '');
-    rows.push([catIdx.get(categoryId), match ? Number(match[1]) : 0, item.id || '', item.code || '', item.name || '']);
+    const shardId = shardIdOf(item.path);
+    rows.push([
+      catIdx.get(categoryId), shardId, item.id || '', item.code || '', item.name || '',
+      item.updatedAt || '', item.updatedBy || '',
+    ]);
   }
   return { v: INDEX_VERSION, cats, items: rows };
 }
@@ -54,16 +90,19 @@ function expandIndex(data) {
   if (Array.isArray(data)) return data; // 兼容旧版完整数组
   const cats = Array.isArray(data?.cats) ? data.cats : [];
   return (Array.isArray(data?.items) ? data.items : []).map(row => {
-    const [catIdx, page, id, code, name] = row;
+    // v2 行只有 5 列，updatedAt/updatedBy 解出来是 undefined，按空串处理
+    const [catIdx, page, id, code, name, updatedAt, updatedBy] = row;
     const categoryId = cats[catIdx] || '';
+    // 兼容旧索引里的数字页码和新索引里的无序分片 ID
+    const shardId = typeof page === 'number' ? String(page).padStart(6, '0') : String(page || '');
     return {
       id,
       categoryId,
       code: code || '',
       name: name || '',
-      path: page
-        ? `${CONFIG.materialsRoot}/categories/${categoryKey(categoryId)}/page-${String(page).padStart(6, '0')}.json`
-        : '',
+      updatedAt: updatedAt || '',
+      updatedBy: updatedBy || '',
+      path: shardId ? shardPathOf(categoryId, shardId) : '',
     };
   });
 }
@@ -140,7 +179,7 @@ async function getCategory(categoryId, force = false) {
       ...defaultCategory(key),
       ...(data || {}),
       categoryId: key,
-      chunks: Array.isArray(data?.chunks) ? data.chunks : [],
+      chunks: normalizeChunks(data?.chunks),
       records: Array.isArray(data?.records) ? data.records : [],
     })).catch(err => {
       categoryCache.delete(key);
@@ -151,23 +190,33 @@ async function getCategory(categoryId, force = false) {
   return categoryCache.get(key);
 }
 
-export async function loadRemote() {
+// 清单很小，首屏必需；先把分片缓存清空，保证之后按需读取的是最新文件
+export async function loadManifest() {
   shardCache.clear();
   categoryCache.clear();
-  const [manifestFile, search] = await Promise.all([
-    GH.getFile(CONFIG.materialsManifestPath),
-    readSearchIndex(),
-  ]);
-  const missingPaths = [];
+  const manifestFile = await GH.getFile(CONFIG.materialsManifestPath);
+  manifestExisted = !!manifestFile;
+  manifest = { ...defaultManifest(), ...(manifestFile ? JSON.parse(manifestFile.content) : {}) };
+  manifest.chunkBytes = Number(manifest.chunkBytes) || CONFIG.materialChunkBytes;
+  manifest.chunkMaxBytes = Number(manifest.chunkMaxBytes) || CONFIG.materialChunkMaxBytes;
+  delete manifest.chunkSize;
+  return {
+    manifest: clone(manifest),
+    missingPaths: manifestFile ? [] : [CONFIG.materialsManifestPath],
+  };
+}
+
+// 全局索引需要下载并解压，可能较慢；单独加载，供首屏渲染后再补上
+export async function loadIndex() {
+  const search = await readSearchIndex();
   indexExisted = search.existed;
   indexGzExisted = search.gz;
-  manifestExisted = !!manifestFile;
-  if (!manifestFile) missingPaths.push(CONFIG.materialsManifestPath);
-  if (!search.existed) missingPaths.push(CONFIG.materialsSearchIndexPath);
-  manifest = { ...defaultManifest(), ...(manifestFile ? JSON.parse(manifestFile.content) : {}) };
   baseIndex = search.items;
   remoteCategoryIds = new Set(baseIndex.map(item => item.categoryId || ''));
-  return { manifest: clone(manifest), materials: clone(baseIndex), missingPaths };
+  return {
+    materials: clone(baseIndex),
+    missingPaths: search.existed ? [] : [CONFIG.materialsSearchIndexPath],
+  };
 }
 
 export async function listCategory(categoryId) {
@@ -175,14 +224,15 @@ export async function listCategory(categoryId) {
   return clone(category.records);
 }
 
-// 只下载当前页摘要所涉及的分片；调用方负责叠加本地草稿。
-export async function hydrate(entries) {
+// 只下载摘要所涉及的分片，逐片加载避免大批量操作时同时发起过多请求；调用方负责叠加本地草稿。
+export async function hydrate(entries, onProgress) {
   const paths = [...new Set(entries.map(item => item.path).filter(Boolean))];
-  const shards = await Promise.all(paths.map(path => getShard(path)));
   const byId = new Map();
-  shards.forEach(records => {
+  for (let i = 0; i < paths.length; i++) {
+    const records = await getShard(paths[i]);
     for (const record of records) byId.set(record.id, record);
-  });
+    onProgress?.(i + 1, paths.length);
+  }
   return entries.map(entry => {
     const record = byId.get(entry.id);
     if (!record) throw new Error(`物料 ${entry.code || entry.id} 不在索引指定的分片中`);
@@ -213,30 +263,116 @@ export async function buildCommitPayload(selectedDrafts, syncedAt, init = false)
     return shardWork.get(path);
   }
 
+  const shardBytes = new Map();
+
+  // 写入分片内容并同步字节数，供后续查找可复用空间
+  function setShardRecords(category, path, records) {
+    const bytes = jsonBytes(JSON.stringify(records, null, 2));
+    shardWork.set(path, records);
+    shardBytes.set(path, bytes);
+    const chunk = category.chunks.find(item => item.path === path);
+    if (chunk) chunk.bytes = bytes;
+    else category.chunks.push({ path, bytes });
+    return bytes;
+  }
+
+  // 分片 ID 无序、只增不复用：拆分/新建都取新 ID，永不重排已有文件
+  function mintShardPath(category, used = new Set(category.chunks.map(chunk => shardIdOf(chunk.path)))) {
+    let id;
+    do { id = crypto.randomUUID().replace(/-/g, '').slice(0, 8); } while (used.has(id));
+    used.add(id);
+    return shardPathOf(category.categoryId, id);
+  }
+
   async function removeExisting(existing, category) {
     const records = await shardFor(existing.path);
     const next = records.filter(item => item.id !== existing.id);
     if (next.length === records.length) throw new Error(`物料 ${existing.code || existing.id} 不在原分片中`);
-    shardWork.set(existing.path, next);
-    if (next.length) deletedShards.delete(existing.path);
-    else {
+    if (!next.length) {
+      shardWork.set(existing.path, next);
+      shardBytes.delete(existing.path);
       deletedShards.add(existing.path);
-      category.chunks = category.chunks.filter(path => path !== existing.path);
+      category.chunks = category.chunks.filter(chunk => chunk.path !== existing.path);
+      return;
     }
+    // 删除后分片可能空出空间，更新字节数让它重新进入可复用范围
+    setShardRecords(category, existing.path, next);
+    deletedShards.delete(existing.path);
+  }
+
+  // 整片超过 800KB 时按记录顺序拆成多片；新片领新 ID，旧片整体删除
+  function splitShard(path, records, category) {
+    const groups = [];
+    let group = [];
+    let groupBytes = 0;
+    for (const record of records) {
+      const size = jsonBytes(JSON.stringify([record], null, 2)) + 4;
+      if (group.length && groupBytes + size > manifest.chunkBytes) {
+        groups.push(group);
+        group = [];
+        groupBytes = 0;
+      }
+      group.push(record);
+      groupBytes += size;
+    }
+    if (group.length) groups.push(group);
+    if (groups.length < 2) return false;
+
+    const used = new Set(category.chunks.map(chunk => shardIdOf(chunk.path)));
+    const placed = groups.map(list => {
+      const nextPath = mintShardPath(category, used);
+      const bytes = jsonBytes(JSON.stringify(list, null, 2));
+      shardWork.set(nextPath, list);
+      shardBytes.set(nextPath, bytes);
+      return { path: nextPath, bytes };
+    });
+    const at = category.chunks.findIndex(chunk => chunk.path === path);
+    if (at >= 0) category.chunks.splice(at, 1, ...placed);
+    else category.chunks.push(...placed);
+    groups.forEach((list, i) => {
+      for (const record of list) {
+        const summary = byId.get(record.id);
+        if (summary) summary.path = placed[i].path;
+      }
+    });
+
+    shardWork.delete(path);
+    shardBytes.delete(path);
+    deletedShards.add(path);
+    return true;
   }
 
   async function addRecord(data, category) {
-    let path = category.chunks[category.chunks.length - 1] || '';
-    let records = path ? await shardFor(path) : [];
-    if (!path || records.length >= manifest.chunkSize) {
-      category.seq = Math.max(category.seq || 0, category.chunks.length) + 1;
-      path = `${CONFIG.materialsRoot}/categories/${categoryKey(category.categoryId)}/page-${String(category.seq).padStart(6, '0')}.json`;
-      category.chunks.push(path);
-      records = [];
+    const incoming = jsonBytes(JSON.stringify([data], null, 2)) + 4;
+
+    // 优先复用空闲空间：在已知字节且装得下的分片里选最满的一片（best fit），减少碎片
+    let target = null;
+    for (const chunk of category.chunks) {
+      if (!Number.isFinite(chunk.bytes)) continue;
+      if (chunk.bytes + incoming > manifest.chunkBytes) continue;
+      if (!target || chunk.bytes > target.bytes) target = chunk;
     }
-    records.push(data);
-    records.sort(compareCode);
-    shardWork.set(path, records);
+
+    // 旧分类索引没有字节数：先补算最后一片，装得下就继续用它
+    if (!target) {
+      const last = category.chunks[category.chunks.length - 1];
+      if (last && !Number.isFinite(last.bytes)) {
+        const records = await shardFor(last.path);
+        const bytes = jsonBytes(JSON.stringify(records, null, 2));
+        last.bytes = bytes;
+        if (bytes + incoming <= manifest.chunkBytes) target = last;
+      }
+    }
+
+    if (target) {
+      const records = await shardFor(target.path);
+      setShardRecords(category, target.path, records.concat(data).sort(compareCode));
+      deletedShards.delete(target.path);
+      return target.path;
+    }
+
+    const path = mintShardPath(category);
+    setShardRecords(category, path, [data]);
     deletedShards.delete(path);
     return path;
   }
@@ -264,13 +400,16 @@ export async function buildCommitPayload(selectedDrafts, syncedAt, init = false)
     affectedCategories.add(newCategoryId);
 
     if (existing && oldCategoryId === newCategoryId) {
+      const category = await categoryFor(newCategoryId);
       const records = await shardFor(existing.path);
       const index = records.findIndex(item => item.id === existing.id);
       if (index < 0) throw new Error(`物料 ${existing.code || existing.id} 不在原分片中`);
       records[index] = next;
       records.sort(compareCode);
-      shardWork.set(existing.path, records);
+      const bytes = setShardRecords(category, existing.path, records);
       Object.assign(existing, summaryOf(next, existing.path));
+      // splitShard 会把摘要里的分片路径改到新片，所以先写摘要再拆
+      if (bytes > manifest.chunkMaxBytes) splitShard(existing.path, records, category);
     } else {
       if (existing) {
         const oldCategory = await categoryFor(oldCategoryId);
@@ -323,6 +462,51 @@ export async function buildCommitPayload(selectedDrafts, syncedAt, init = false)
   };
 }
 
+// 提交成功后直接用本次 payload 更新内存，不再重新下载整批文件。
+export async function applyCommitPayload({ fileChanges = [], treeDeletes = [] }) {
+  const categoryRoot = `${CONFIG.materialsRoot}/categories/`;
+  for (const change of fileChanges) {
+    if (change.path === CONFIG.materialsSearchIndexPath && typeof change.base64 === 'string') {
+      const bytes = GH.bytesFromBase64(change.base64);
+      baseIndex = expandIndex(JSON.parse(await gunzipToText(bytes)));
+      remoteCategoryIds = new Set(baseIndex.map(item => item.categoryId || ''));
+      indexExisted = true;
+      indexGzExisted = true;
+    } else if (change.path === CONFIG.materialsManifestPath) {
+      manifest = { ...defaultManifest(), ...JSON.parse(change.content) };
+      manifest.chunkBytes = Number(manifest.chunkBytes) || CONFIG.materialChunkBytes;
+      manifest.chunkMaxBytes = Number(manifest.chunkMaxBytes) || CONFIG.materialChunkMaxBytes;
+      delete manifest.chunkSize;
+      manifestExisted = true;
+    } else if (change.path.startsWith(categoryRoot) && change.path.endsWith('/index.json')) {
+      const data = JSON.parse(change.content);
+      const categoryId = data.categoryId || '';
+      categoryCache.set(categoryId, Promise.resolve({
+        ...defaultCategory(categoryId),
+        ...data,
+        categoryId,
+        chunks: normalizeChunks(data.chunks),
+        records: Array.isArray(data.records) ? data.records : [],
+      }));
+    } else if (change.path.startsWith(categoryRoot) && shardIdOf(change.path)) {
+      const records = JSON.parse(change.content);
+      if (!Array.isArray(records)) throw new Error(`物料分片格式错误：${change.path}`);
+      shardCache.set(change.path, Promise.resolve(records));
+    }
+  }
+
+  for (const { path } of treeDeletes) {
+    if (path.startsWith(categoryRoot) && shardIdOf(path)) {
+      shardCache.delete(path);
+    } else if (path.startsWith(categoryRoot) && path.endsWith('/index.json')) {
+      for (const key of categoryCache.keys()) {
+        if (categoryIndexPath(key) === path) categoryCache.delete(key);
+      }
+    }
+  }
+  return clone(baseIndex);
+}
+
 /**
  * 重建全局搜索索引与清单：逐个分组读取分类索引（缺失时读分片），
  * 用于修复「分片里有物料但搜索索引为空」这类不一致。
@@ -332,9 +516,17 @@ export async function rebuildSearchIndex(categoryIds, onProgress) {
   let done = 0;
   for (const categoryId of categoryIds) {
     const category = await getCategory(categoryId, true);
-    const records = (category.records || []).length
-      ? category.records
-      : (await Promise.all((category.chunks || []).map(path => getShard(path)))).flat();
+    let records;
+    if ((category.records || []).length) {
+      records = category.records;
+    } else {
+      // 分类索引丢了时从分片恢复，需要把分片路径补回摘要
+      const shards = await Promise.all((category.chunks || []).map(async chunk => {
+        const path = chunkPathOf(chunk);
+        return { path, list: await getShard(path) };
+      }));
+      records = shards.flatMap(({ path, list }) => list.map(record => ({ ...record, path })));
+    }
     for (const record of records) {
       if (!record || !record.id) continue;
       byId.set(record.id, summaryOf(record, record.path || ''));
