@@ -62,6 +62,7 @@ const state = {
   dictChecked: new Set(),     // 字典设置页勾选
   setChecked: new Set(),      // 属性集合页勾选
   draggingCatId: null,        // 正在拖拽的分组 id
+  copyingMaterials: false,    // 批量复制进行中，防止重复生成副本
 };
 
 const mint = (prefix) => `${prefix}_${crypto.randomUUID().slice(0, 8)}`;
@@ -397,6 +398,7 @@ const INDEX_CACHE_KEY = 'materials.index.v1';
 const indexCacheKey = () => `${INDEX_CACHE_KEY}:${state.cacheNs}`;
 
 async function refreshRemote({ awaitIndex = false } = {}) {
+  state.indexRefreshed = false;
   setLoading();
   progressStart('连接数据仓库…');
   const totalSteps = 3 + DATA_SETS.length;
@@ -471,11 +473,13 @@ async function refreshRemote({ awaitIndex = false } = {}) {
   }
 
   state.indexPromise = loadMaterialIndex();
-  if (awaitIndex) await state.indexPromise;
+  if (awaitIndex) return state.indexPromise;
+  return true;
 }
 
 // 后台加载全局索引：到达后合并计数、启用全局搜索，并写入本地缓存供下次首屏使用
 async function loadMaterialIndex() {
+  state.indexRefreshed = false;
   try {
     const data = await MaterialStore.loadIndex();
     state.baseMaterials = data.materials;
@@ -491,11 +495,14 @@ async function loadMaterialIndex() {
     // 弹窗打开时可能正在编辑，先不重绘背景；关闭后其他操作会重新渲染
     if (state.view === 'materials' && document.getElementById('modalMask')?.classList.contains('hidden')) render();
     else if (state.view === 'commit') render();
+    return true;
   } catch (e) {
+    state.indexRefreshed = false;
     console.warn('物料索引加载失败', e);
     if (state.indexLoaded) toast('物料索引刷新失败，当前显示上次缓存的数据', 'warn', 4000);
     else toastErr('物料索引加载失败：' + (e.message || e));
     if (state.view === 'materials') render();
+    return false;
   }
 }
 
@@ -1046,8 +1053,8 @@ function buildSideRail() {
   move.disabled = !state.checked.size;
   move.addEventListener('click', () => openBatchMoveDialog());
 
-  const copy = mk('button', { class: 'rail-btn', title: '复制选中物料（先勾选 1 条）' }, '⧉');
-  copy.disabled = state.checked.size !== 1;
+  const copy = mk('button', { class: 'rail-btn', id: 'copyMaterialsBtn', title: '复制选中物料（先勾选）' }, '⧉');
+  copy.disabled = !state.checked.size || state.copyingMaterials;
   copy.addEventListener('click', () => doCopyMaterial());
 
   const del = mk('button', { class: 'rail-btn danger-hover', title: '批量删除（先勾选）' }, '✕');
@@ -1370,31 +1377,48 @@ async function doDeleteMaterial(m) {
 }
 
 // ---------- 批量操作 ----------
-// 复制选中物料：新编码、同分组、属性值深拷贝，名称加「（副本）」
+// 复制选中物料：每条生成新编码、保留原分组、属性值深拷贝，名称加「（副本）」
 async function doCopyMaterial() {
+  if (state.copyingMaterials) return;
   const ids = Array.from(state.checked);
-  if (ids.length !== 1) { toastErr('请先勾选 1 条物料再复制'); return; }
-  const src = await getMaterialById(ids[0]);
-  if (!src) { toastErr('物料不存在'); return; }
-
-  const copyId = mint('m');
-  const mat = {
-    id: copyId,
-    categoryId: src.categoryId || '',
-    code: tempCode(copyId),
-    name: `${src.name || src.code}（副本）`,
-    attrs: clone(src.attrs || {}),
-    location: 'local',
-    syncedAt: '',
-    createdAt: nowISO(),
-    updatedAt: nowISO(),
-    createdBy: '',
-    updatedBy: '',
-  };
-  await saveMaterialDraft(mat, 'add');
-  state.checked.clear();
-  render();
-  toastOk('已复制，提交后生成编码');
+  if (!ids.length) { toastErr('请先勾选物料再复制'); return; }
+  state.copyingMaterials = true;
+  const copyButton = document.getElementById('copyMaterialsBtn');
+  if (copyButton) copyButton.disabled = true;
+  const summaries = ids.map(id => state.materials.find(item => item.id === id)).filter(Boolean);
+  progressStart('加载物料分片…');
+  try {
+    const sources = await hydrateMaterials(summaries,
+      (done, total) => progressSet(done, total, '加载物料分片'));
+    const drafts = sources.map(src => {
+      const copyId = mint('m');
+      return makeMaterialDraft({
+        id: copyId,
+        categoryId: src.categoryId || '',
+        code: tempCode(copyId),
+        name: `${src.name || src.code}（副本）`,
+        attrs: clone(src.attrs || {}),
+        location: 'local',
+        syncedAt: '',
+        createdAt: nowISO(),
+        updatedAt: nowISO(),
+        createdBy: '',
+        updatedBy: '',
+      }, 'add');
+    });
+    await Store.putDrafts(drafts);
+    await loadDrafts();
+    state.checked.clear();
+    render();
+    toastOk(`已复制 ${sources.length} 条物料，提交后生成编码`);
+  } catch (e) {
+    toastErr('批量复制失败：' + (e.message || e));
+  } finally {
+    state.copyingMaterials = false;
+    const currentCopyButton = document.getElementById('copyMaterialsBtn');
+    if (currentCopyButton) currentCopyButton.disabled = !state.checked.size;
+    progressEnd();
+  }
 }
 
 // ---------- 分组选择器（可搜索下拉） ----------
@@ -2954,7 +2978,15 @@ async function doCommit(selectedIds, message, btn, includeInit) {
       // 别人先提交了：同步最新数据后重新分配编码并自动重试一次
       if (e.code === 'CONFLICT' && attempt === 0) {
         toast('远端已更新，正在重新同步并重试…');
-        await refreshRemote({ awaitIndex: true });
+        const refreshed = await refreshRemote({ awaitIndex: true });
+        if (!refreshed) {
+          btn.disabled = false;
+          btn.textContent = oldText;
+          progressEnd();
+          toastErr('提交失败：物料索引刷新失败，请重试');
+          render();
+          return;
+        }
         await loadDrafts();
         draftsToSubmit = state.drafts.filter(d => selectedIds.includes(d.id));
         if (!draftsToSubmit.length) {

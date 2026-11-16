@@ -19,10 +19,10 @@ export function setCacheContext(ns, head) {
 
 const fileCacheKey = (path) => `file:${cacheNs}:${path}`;
 
-async function readFileCache(key) {
+async function readFileCache(key, head) {
   try {
     const hit = await Store.getMeta(key);
-    return hit && hit.head === cacheHead ? hit : null;
+    return hit && hit.head === head ? hit : null;
   } catch (_) { return null; }
 }
 
@@ -192,16 +192,49 @@ export async function getCommit(sha) {
   return ghFetch(apiUrl(`/git/commits/${sha}`));
 }
 
+// GitHub 删除不存在的路径会直接 422（GitRPC::BadObjectState），删之前先用父目录列表核对。
+// 目录 404 说明整批都不存在；核对本身出错时跳过删除，不为可选清理卡住提交。
+export async function filterExistingPaths(paths) {
+  const dirs = new Map();
+  for (const path of new Set(paths)) {
+    const cut = path.lastIndexOf('/');
+    const dir = cut < 0 ? '' : path.slice(0, cut);
+    if (!dirs.has(dir)) dirs.set(dir, []);
+    dirs.get(dir).push({ path, name: cut < 0 ? path : path.slice(cut + 1) });
+  }
+
+  const existing = [];
+  const { branch } = getRepoSettings();
+  for (const [dir, items] of dirs) {
+    let data;
+    try {
+      const encoded = dir.split('/').map(encodeURIComponent).join('/');
+      data = await ghFetch(apiUrl(`/contents/${encoded}?ref=${encodeURIComponent(branch)}`));
+    } catch (e) {
+      if (e.status === 404) continue;
+      console.warn('核对待删除文件失败，本次跳过删除', e);
+      continue;
+    }
+    const names = new Set((Array.isArray(data) ? data : []).map(item => item.name));
+    for (const item of items) if (names.has(item.name)) existing.push(item.path);
+  }
+  return existing;
+}
+
 // 通过 contents API 取文件；文件过大（>1MB 会返回 403）或接口异常时降级用 raw
 // 返回 { content: 解码后的文本, sha: 文件 blob sha（raw 降级时为 null）, encoding }
 export async function getFile(path) {
   if (!cacheNs || !cacheHead) return getFileRemote(path);
-  const key = fileCacheKey(path);
-  const hit = await readFileCache(key);
+  const ns = cacheNs;
+  const head = cacheHead;
+  const key = `file:${ns}:${path}`;
+  const hit = await readFileCache(key, head);
   if (hit) return hit.missing ? null : { content: hit.text, sha: hit.sha || null, encoding: 'utf8' };
   const file = await getFileRemote(path);
-  // 404 也缓存，避免每次打开都对不存在的文件再请求一次
-  await writeFileCache(key, file ? { text: file.content, sha: file.sha || null } : { missing: true });
+  // 仅当前请求上下文未变化时写入；404 也缓存，避免重复请求不存在的文件
+  if (cacheNs === ns && cacheHead === head) {
+    await writeFileCache(key, file ? { text: file.content, sha: file.sha || null } : { missing: true });
+  }
   return file;
 }
 
@@ -222,7 +255,13 @@ async function getFileRemote(path) {
       `${CONFIG.apiBase}/repos/${owner}/${repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${branch}`,
       { headers: { ...authHeaders(getToken()), Accept: 'application/vnd.github.raw' } }
     );
-    if (!res.ok) return null;
+    if (res.status === 404) return null;
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      const err = new Error(`GitHub API ${res.status} ${res.statusText}: ${body.slice(0, 300)}`);
+      err.status = res.status;
+      throw err;
+    }
     return { content: await res.text(), sha: null, encoding: 'utf8' };
   }
 }
@@ -231,14 +270,14 @@ async function getFileRemote(path) {
 // 返回 { bytes: Uint8Array }；文件不存在返回 null
 export async function getFileBinary(path) {
   if (!cacheNs || !cacheHead) return getFileBinaryRemote(path);
-  const key = fileCacheKey(path);
-  const hit = await readFileCache(key);
+  const ns = cacheNs;
+  const head = cacheHead;
+  const key = `file:${ns}:${path}`;
+  const hit = await readFileCache(key, head);
   if (hit) return hit.missing ? null : { bytes: hit.bytes };
   const file = await getFileBinaryRemote(path);
-  if (file) {
-    await writeFileCache(key, { bytes: file.bytes });
-  } else {
-    await writeFileCache(key, { missing: true });
+  if (cacheNs === ns && cacheHead === head) {
+    await writeFileCache(key, file ? { bytes: file.bytes } : { missing: true });
   }
   return file;
 }

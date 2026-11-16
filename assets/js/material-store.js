@@ -458,7 +458,8 @@ export async function buildCommitPayload(selectedDrafts, syncedAt, init = false)
   for (const path of deletes) changes.delete(path);
   return {
     fileChanges: Array.from(changes, ([path, change]) => ({ path, ...change })),
-    treeDeletes: Array.from(deletes, path => ({ path })),
+    // 旧格式文件可能早就被删过，只删远端确实存在的路径
+    treeDeletes: (await GH.filterExistingPaths([...deletes])).map(path => ({ path })),
   };
 }
 
@@ -543,7 +544,7 @@ export async function rebuildSearchIndex(categoryIds, onProgress) {
       { path: CONFIG.materialsSearchIndexPath, base64: await gzipToBase64(JSON.stringify(compactIndex(baseIndex))) },
       { path: CONFIG.materialsManifestPath, content: JSON.stringify(manifest, null, 2) + '\n' },
     ],
-    treeDeletes: [{ path: CONFIG.legacySearchIndexPath }],
+    treeDeletes: (await GH.filterExistingPaths([CONFIG.legacySearchIndexPath])).map(path => ({ path })),
     total: baseIndex.length,
   };
 }
