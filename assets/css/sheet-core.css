@@ -1,0 +1,110 @@
+/* ============================================================
+   sheet-core.css — 可复用表格内核样式
+   只描述表格本身，不依赖任何宿主主题变量（用 --sc-* 前缀）
+   宿主可用 :root{ --sc-primary: ... } 覆盖
+   ============================================================ */
+:root {
+  --sc-primary: #2f6fed;
+  --sc-primary-soft: #eaf1ff;
+  --sc-border: #e6e8eb;
+  --sc-border-strong: #cfd4da;
+  --sc-text: #1f2328;
+  --sc-muted: #7a8189;
+  --sc-head-bg: #f6f8fa;
+  --sc-dirty-bg: #fffbe6;
+  --sc-radius: 6px;
+  --sc-font: 13px;
+}
+
+.sc-root { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 0 14px; box-sizing: border-box; }
+
+.sc-toolbar { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--sc-border); }
+.sc-toolbar input.sc-search {
+  flex: 1; max-width: 420px; height: 32px; padding: 0 10px; box-sizing: border-box;
+  border: 1px solid var(--sc-border-strong); border-radius: var(--sc-radius);
+  font-size: var(--sc-font); font-family: inherit; color: var(--sc-text); outline: none;
+}
+.sc-toolbar input.sc-search:focus { border-color: var(--sc-primary); }
+.sc-toolbar .sc-count { font-size: 12px; color: var(--sc-muted); }
+.sc-toolbar .sc-extra { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+
+.sc-scroll { flex: 1; min-height: 0; overflow: auto; position: relative; }
+
+.sc-table { border-collapse: separate; border-spacing: 0; table-layout: fixed; }
+.sc-table th, .sc-table td {
+  border-right: 1px solid var(--sc-border);
+  border-bottom: 1px solid var(--sc-border);
+  font-size: var(--sc-font); color: var(--sc-text);
+  padding: 0 10px; height: 30px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+  background: #fff; box-sizing: border-box; position: relative;
+  user-select: none;
+}
+.sc-table thead th {
+  position: sticky; top: 0; z-index: 3; height: 32px;
+  background: var(--sc-head-bg); color: #1f2328; font-weight: 600;
+  text-align: left; border-bottom: 1px solid var(--sc-border-strong);
+}
+.sc-table td.sc-readonly { color: var(--sc-muted); cursor: default; }
+.sc-table td.sc-align-right { text-align: right; }
+.sc-table td.sc-align-center { text-align: center; }
+
+/* 冻结列 */
+.sc-frozen { position: sticky; z-index: 2; }
+.sc-table thead th.sc-frozen { z-index: 4; }
+/* 冻结边界阴影 */
+.sc-frozen-last::after {
+  content: ''; position: absolute; top: 0; right: -6px; bottom: 0; width: 6px;
+  pointer-events: none;
+  background: linear-gradient(to right, rgba(0,0,0,.06), rgba(0,0,0,0));
+}
+
+/* 选区 / 编辑 */
+.sc-table td.sc-sel { outline: 2px solid var(--sc-primary); outline-offset: -2px; background: var(--sc-primary-soft); }
+.sc-table td.sc-range { background: var(--sc-primary-soft); }
+.sc-table td input.sc-input {
+  position: absolute; inset: 0; width: 100%; height: 100%; box-sizing: border-box;
+  border: none; outline: none; font: inherit; padding: 0 10px; background: #fff;
+  color: var(--sc-text);
+}
+.sc-fill-handle {
+  position: absolute; right: -3px; bottom: -3px; width: 7px; height: 7px;
+  background: var(--sc-primary); cursor: crosshair; display: none; z-index: 5;
+}
+.sc-table td.sc-sel .sc-fill-handle { display: block; }
+
+/* 行脏标记 */
+.sc-table tr.sc-dirty td { background: var(--sc-dirty-bg); }
+.sc-table tr.sc-error td { background: #fdecec; }
+
+/* 填充拖拽预览框 */
+.sc-fill-ghost {
+  position: absolute; border: 1px dashed var(--sc-primary); background: rgba(47,111,237,.06);
+  pointer-events: none; z-index: 6; display: none;
+}
+
+/* 列宽拖拽 */
+.sc-resizer {
+  position: absolute; top: 0; right: -3px; width: 7px; height: 100%;
+  cursor: col-resize; z-index: 6;
+}
+.sc-sort-ind { margin-left: 4px; font-size: 10px; color: var(--sc-primary); }
+
+/* 空态 / 日志 */
+.sc-empty { padding: 40px; text-align: center; color: var(--sc-muted); font-size: var(--sc-font); }
+.sc-log {
+  height: 96px; border-top: 1px solid var(--sc-border); overflow-y: auto;
+  padding: 8px 0; font-size: 12px; color: var(--sc-muted); background: #fafbfc;
+  flex-shrink: 0;
+}
+.sc-log div { padding: 2px 0; }
+.sc-log .ok { color: #1a7f37; }
+.sc-log .warn { color: #9a6700; }
+.sc-log .err { color: #cf222e; }
+
+/* 弹层（宿主可覆盖） */
+.sc-pop {
+  position: fixed; z-index: 900; background: #fff; border: 1px solid var(--sc-border-strong);
+  border-radius: var(--sc-radius); box-shadow: 0 8px 24px rgba(31,35,40,.12);
+  font-size: 12px; padding: 6px; min-width: 160px; max-height: 260px; overflow: auto;
+}

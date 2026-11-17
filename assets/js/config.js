@@ -17,6 +17,7 @@ export const CONFIG = {
   materialChunkMaxBytes: 800 * 1024,
   dictionariesPath: 'data/dictionaries.json',
   attrSetsPath: 'data/attrSets.json',
+  menuPath: 'data/menu.json',   // 菜单配置：只存排序/显隐/改名/图标与自定义菜单
 
   // 附件限制
   attachmentMaxSizeMB: 25,

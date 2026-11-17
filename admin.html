@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Craft 系统 · 管理端</title>
   <link rel="stylesheet" href="assets/css/admin.css" />
+  <link rel="stylesheet" href="assets/css/sheet-core.css" />
 </head>
 <body>
   <div class="app-progress" id="appProgress" hidden>
@@ -13,23 +14,20 @@
   </div>
   <div class="layout">
     <!-- 左侧导航 -->
-    <aside class="sidebar">
-      <div class="brand">Craft 系统</div>
-      <nav class="nav">
-        <a href="javascript:;" class="nav-item active" data-view="materials">物料及分组</a>
-        <a href="javascript:;" class="nav-item nav-parent" data-view="settings">系统设置<span class="nav-caret">▸</span></a>
-        <a href="javascript:;" class="nav-item nav-sub" data-view="settings" data-sub="dict">字典设置</a>
-        <a href="javascript:;" class="nav-item nav-sub" data-view="settings" data-sub="set">属性集合</a>
-        <a href="javascript:;" class="nav-item nav-sub" data-view="commit">提交管理<span class="nav-badge" id="commitCount" hidden></span></a>
-        <a href="icons.html" class="nav-item" target="_blank" rel="noopener">图标库（临时）</a>
-        <a href="index.html" class="nav-item">返回官网</a>
-      </nav>
+    <aside class="sidebar collapsed" id="appSidebar">
+      <div class="brand" id="brandToggle" role="button" tabindex="0" title="展开导航">
+        <span class="brand-mark" aria-hidden="true">C</span>
+        <span class="brand-name">Craft 系统</span>
+        <span class="brand-toggle" aria-hidden="true">»</span>
+      </div>
+      <nav class="nav" id="navMenu"></nav>
+      <div class="nav-footer" id="navFooter"></div>
     </aside>
 
     <!-- 右侧主区域 -->
     <div class="main">
       <header class="topbar">
-        <div class="topbar-title" id="topbarTitle">物料及分组</div>
+        <div class="topbar-title" id="topbarTitle">物料管理</div>
         <div class="topbar-actions">
           <div class="global-material-search" id="globalMaterialSearchWrap">
             <input id="globalMaterialSearch" type="search" placeholder="全局搜索：物料编码 / 名称" autocomplete="off" />

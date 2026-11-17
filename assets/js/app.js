@@ -23,6 +23,7 @@ import * as Cat from './categories.js';
 import * as Excel from './excel.js';
 import * as MaterialStore from './material-store.js';
 import { renderForm, renderAttrDefTable, mk } from './fields.js';
+import { createSheet } from './sheet-core.js';
 import { openModal, closeModal, toastOk, toastErr, confirm, toast } from './ui.js';
 
 // ---------- 全局状态 ----------
@@ -59,10 +60,19 @@ const state = {
   materialPage: 1,
   materialPageSize: 20,
   materialViewSeq: 0,
+  // 物料档案的展示形态：list（列表）/ sheet（表格，可在单元格内直接编辑）
+  materialView: localStorage.getItem('craft.materials.view') === 'sheet' ? 'sheet' : 'list',
+  sheetApi: null,
   dictChecked: new Set(),     // 字典设置页勾选
   setChecked: new Set(),      // 属性集合页勾选
   draggingCatId: null,        // 正在拖拽的分组 id
   copyingMaterials: false,    // 批量复制进行中，防止重复生成副本
+  // 菜单：内置菜单写死在代码里，menu.json 只存排序/显隐/改名/图标和自定义项
+  baseMenu: null,
+  menu: null,
+  rawMenuText: null,
+  menuSearch: '',
+  menuChecked: new Set(),
 };
 
 const mint = (prefix) => `${prefix}_${crypto.randomUUID().slice(0, 8)}`;
@@ -133,6 +143,95 @@ async function prepareDraftsWithCodes(drafts) {
 }
 const clone = (v) => JSON.parse(JSON.stringify(v));
 const UNGROUPED = '';          // 未分组的 categoryId
+
+// ---------- 导航菜单 ----------
+// 系统内置菜单：不可删除；只能调整顺序、显隐、名称与图标
+const NAV_BUILTINS = {
+  materials: { label: '物料管理', icon: '▤', view: 'materials' },
+  settings: {
+    label: '系统设置', icon: '⚙', view: 'settings',
+    children: {
+      dict:   { label: '字典设置', view: 'settings', sub: 'dict' },
+      set:    { label: '属性集合', view: 'settings', sub: 'set' },
+      commit: { label: '提交管理', view: 'commit', badge: true },
+      menu:   { label: '菜单管理', view: 'settings', sub: 'menu', locked: true },
+    },
+  },
+  icons: { label: '图标库', icon: '◫', href: 'icons.html', newTab: true },
+};
+const NAV_FOOTER = { label: '返回官网', icon: '⌂', href: 'index.html' };
+const NAV_ICONS = ['▦', '▤', '▥', '◫', '◈', '◉', '⧉', '☰', '≡', '⌂', '⚙', '✎',
+  '⊞', '⊗', '↗', '★', '◆', '⬢', '☷', '◧', '▣', '▧'];
+
+function defaultMenuConfig() {
+  return {
+    version: 1,
+    order: ['materials', 'settings', 'icons'],
+    children: { settings: ['dict', 'set', 'commit', 'menu'] },
+    overrides: {},
+    custom: [],
+  };
+}
+
+// 兼容旧配置：补齐内置项、剔除失效项、保证每个菜单只出现一次，最多三级
+function normalizeMenu(raw) {
+  const base = defaultMenuConfig();
+  const cfg = raw && typeof raw === 'object' ? raw : base;
+  const custom = Array.isArray(cfg.custom) ? cfg.custom.filter(x => x && x.id) : [];
+  const customIds = new Set(custom.map(c => c.id));
+  const known = (key) => !!NAV_BUILTINS[key] || !!NAV_BUILTINS.settings.children[key] || customIds.has(key);
+  const seen = new Set();
+  const take = (list) => (Array.isArray(list) ? list : []).filter(key => {
+    if (!known(key) || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  const cfgChildren = cfg.children && typeof cfg.children === 'object' ? cfg.children : {};
+  // 内置子项不能出现在一级
+  const srcOrder = (Array.isArray(cfg.order) ? cfg.order : base.order)
+    .filter(key => !NAV_BUILTINS.settings.children[key]);
+  const out = {
+    version: 1,
+    order: take(srcOrder),
+    children: {},
+    overrides: cfg.overrides && typeof cfg.overrides === 'object' ? cfg.overrides : {},
+    custom,
+  };
+  for (const key of Object.keys(NAV_BUILTINS)) {
+    if (!seen.has(key)) { out.order.push(key); seen.add(key); }
+  }
+
+  // 子菜单：内置「系统设置」+ 自定义父项
+  for (const parent of ['settings', ...custom.map(c => c.id)]) {
+    const source = Array.isArray(cfgChildren[parent]) ? cfgChildren[parent]
+      : parent === 'settings' ? base.children.settings : [];
+    const list = take(source);
+    if (parent === 'settings') {
+      for (const key of base.children.settings) {
+        if (!seen.has(key)) { list.push(key); seen.add(key); }
+      }
+    }
+    if (list.length) out.children[parent] = list;
+  }
+  // 没出现在任何位置的菜单挂回一级
+  for (const key of custom.map(c => c.id)) {
+    if (!seen.has(key)) { out.order.push(key); seen.add(key); }
+  }
+  return out;
+}
+
+const menuOverride = (key) => (state.menu?.overrides?.[key]) || {};
+// 一级菜单和「系统设置」的子项都算内置项，统一按 key 取默认定义
+function menuDef(key) {
+  if (NAV_BUILTINS[key]) return NAV_BUILTINS[key];
+  const child = NAV_BUILTINS.settings.children[key];
+  if (child) return child;
+  return state.menu?.custom?.find(c => c.id === key) || null;
+}
+const menuLabel = (key) => menuOverride(key).label || menuDef(key)?.label || key;
+const menuIcon = (key) => menuOverride(key).icon || menuDef(key)?.icon || '•';
+const menuVisible = (key) => menuOverride(key).visible !== false;
 
 // 配置数据整文件处理；物料由 MaterialStore 按分类分片处理
 const DATA_SETS = [
@@ -224,6 +323,7 @@ async function init() {
   }
 
   await loadDrafts();
+  renderNav();
   await autoFixLooseMaterials();
   render();
 }
@@ -282,19 +382,199 @@ function bindAccountBar() {
 }
 
 function bindNav() {
-  document.querySelectorAll('.nav-item').forEach(item => {
-    if (!item.dataset.view) return;
+  const sidebar = document.getElementById('appSidebar');
+  const brand = document.getElementById('brandToggle');
+  const setCollapsed = (collapsed) => {
+    sidebar.classList.toggle('collapsed', collapsed);
+    const action = brand?.querySelector('.brand-toggle');
+    if (action) action.textContent = collapsed ? '»' : '«';
+    if (brand) brand.title = collapsed ? '展开导航' : '收起导航';
+  };
+  // 默认收起，且不做记忆：每次刷新都回到收起态
+  setCollapsed(true);
+  if (brand) {
+    brand.addEventListener('click', () => setCollapsed(!sidebar.classList.contains('collapsed')));
+    brand.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      e.preventDefault();
+      brand.click();
+    });
+  }
+  const saved = localStorage.getItem('craft.navOpen');
+  toggleNavGroup(saved === '1');
+}
+
+// 渲染导航：内置菜单 + 配置里的顺序/显隐/改名/图标 + 自定义项；底部固定「返回官网」
+function renderNav() {
+  const nav = document.getElementById('navMenu');
+  const footer = document.getElementById('navFooter');
+  if (!nav) return;
+  if (!state.menu) state.menu = normalizeMenu(state.baseMenu || defaultMenuConfig());
+  nav.innerHTML = '';
+
+  const iconEl = (icon) => mk('span', { class: 'nav-icon', 'aria-hidden': 'true' }, icon);
+  const labelEl = (text) => mk('span', { class: 'nav-label' }, text);
+
+  const isVisible = (key) => {
+    const builtin = NAV_BUILTINS[key] || NAV_BUILTINS.settings.children[key];
+    if (builtin) return menuVisible(key);
+    const custom = state.menu.custom.find(c => c.id === key);
+    return !!custom && custom.visible !== false;
+  };
+
+  // 递归渲染，最多三级：1 一级导航、2 二级导航、3 三级导航
+  const renderItem = (key, depth) => {
+    if (!isVisible(key)) return null;
+    const builtin = NAV_BUILTINS[key] || NAV_BUILTINS.settings.children[key] || null;
+    const custom = builtin ? null : state.menu.custom.find(c => c.id === key);
+    if (!builtin && !custom) return null;
+
+    const label = builtin ? menuLabel(key) : (custom.label || '未命名');
+    const kids = (state.menu.children[key] || []).filter(isVisible);
+    const isSub = depth > 1;
+
+    if (!kids.length) {
+      const a = mk('a', {
+        class: 'nav-item' + (isSub ? ' nav-sub' : ''),
+        href: builtin ? (builtin.href || 'javascript:;') : (custom.href || 'javascript:;'),
+        title: label,
+        ...(builtin?.view ? { 'data-view': builtin.view } : {}),
+        ...(builtin?.sub ? { 'data-sub': builtin.sub } : {}),
+      });
+      const newTab = builtin ? builtin.newTab
+        : (custom.href && (custom.newTab !== false || /^https?:/i.test(custom.href)));
+      if (newTab) { a.setAttribute('target', '_blank'); a.setAttribute('rel', 'noopener'); }
+      if (isSub) {
+        a.appendChild(document.createTextNode(label));
+      } else {
+        a.appendChild(iconEl(builtin ? menuIcon(key) : (custom.icon || '↗')));
+        a.appendChild(labelEl(label));
+      }
+      if (builtin?.badge) a.appendChild(mk('span', { class: 'nav-badge', id: 'commitCount', hidden: true }));
+      return a;
+    }
+
+    // 带子项的分组：一级显示图标，二/三级只有文字和展开箭头
+    const group = mk('div', { class: 'nav-group' + (isSub ? ' nested' : '') });
+    const parent = mk('a', {
+      class: 'nav-item nav-parent' + (isSub ? ' nav-sub' : ''),
+      href: 'javascript:;',
+      title: label,
+      ...(builtin?.view ? { 'data-view': builtin.view } : {}),
+    });
+    if (isSub) parent.appendChild(document.createTextNode(label));
+    else {
+      parent.appendChild(iconEl(builtin ? menuIcon(key) : (custom.icon || '↗')));
+      parent.appendChild(labelEl(label));
+    }
+    parent.appendChild(mk('span', { class: 'nav-caret' }, '▸'));
+    group.appendChild(parent);
+
+    const subs = mk('div', { class: 'nav-subs' });
+    for (const childKey of kids) {
+      const el = renderItem(childKey, depth + 1);
+      if (el) subs.appendChild(el);
+    }
+    group.appendChild(subs);
+    return group;
+  };
+
+  for (const key of state.menu.order) {
+    const el = renderItem(key, 1);
+    if (el) nav.appendChild(el);
+  }
+
+  // 恢复「系统设置」上次的展开状态
+  if (state.navOpen) {
+    const settingsParent = nav.querySelector('.nav-group:not(.nested) > .nav-parent[data-view="settings"]');
+    settingsParent?.parentElement.classList.add('expanded');
+  }
+
+  if (footer) {
+    footer.innerHTML = '';
+    const home = mk('a', { class: 'nav-item', href: NAV_FOOTER.href, title: NAV_FOOTER.label });
+    home.appendChild(iconEl(NAV_FOOTER.icon));
+    home.appendChild(labelEl(NAV_FOOTER.label));
+    footer.appendChild(home);
+  }
+
+  bindNavItems();
+  paintActiveNav();
+  updateCommitBadge();
+}
+
+// 导航项事件：点击切换视图 + 收起态浮窗
+function bindNavItems() {
+  const sidebar = document.getElementById('appSidebar');
+
+  document.querySelectorAll('#navMenu .nav-item').forEach(item => {
+    const isParent = item.classList.contains('nav-parent');
+    if (!item.dataset.view && !isParent) return;
     item.addEventListener('click', () => {
-      // 父项：已在系统设置里则只做展开/收起；从别的视图进来先展开再切换
-      if (item.classList.contains('nav-parent')) {
+      if (isParent) {
+        // 收起态下父项没有内联二级，内置视图直接进入；浮窗由悬停控制
+        if (sidebar.classList.contains('collapsed')) {
+          if (item.dataset.view) switchView(item.dataset.view, item.dataset.sub);
+          return;
+        }
+        // 自定义分组：点击展开/收起自身的子菜单；收起时一并收起所有下级
+        if (!item.dataset.view) {
+          const group = item.parentElement;
+          const expand = !group.classList.contains('expanded');
+          group.classList.toggle('expanded', expand);
+          if (!expand) group.querySelectorAll('.nav-group.expanded').forEach(g => g.classList.remove('expanded'));
+          return;
+        }
+        // 内置「系统设置」：展开态维持原来的展开/收起
         if (state.view === 'settings') { toggleNavGroup(!state.navOpen); return; }
         toggleNavGroup(true);
       }
       switchView(item.dataset.view, item.dataset.sub);
     });
   });
-  const saved = localStorage.getItem('craft.navOpen');
-  toggleNavGroup(saved === '1');
+
+  // 收起态浮窗：悬停父项展开，点选条目后立即收起且不会被 hover 重新撑开
+  document.querySelectorAll('#navMenu .nav-group').forEach(group => {
+    const parent = group.querySelector(':scope > .nav-parent');
+    const subs = group.querySelector(':scope > .nav-subs');
+    if (!parent || !subs) return;
+    let hideTimer = null;
+
+    const open = () => {
+      clearTimeout(hideTimer);
+      if (sidebar.classList.contains('collapsed')) subs.classList.add('open');
+    };
+    const close = () => {
+      clearTimeout(hideTimer);
+      subs.classList.remove('open');
+      subs.querySelectorAll('.nav-subs.open').forEach(el => el.classList.remove('open'));
+    };
+    const scheduleClose = () => {
+      clearTimeout(hideTimer);
+      hideTimer = setTimeout(close, 150);
+    };
+
+    parent.addEventListener('mouseenter', open);
+    parent.addEventListener('mouseleave', scheduleClose);
+    subs.addEventListener('mouseenter', () => clearTimeout(hideTimer));
+    subs.addEventListener('mouseleave', scheduleClose);
+    // 键盘 Tab 进入父项时同样展开
+    parent.addEventListener('focus', open);
+    // 点选后收起；指针可能还停在浮窗位置，这里不依赖 CSS :hover 就不会再弹开
+    subs.querySelectorAll('.nav-item').forEach(sub => {
+      if (sub.classList.contains('nav-parent')) return;
+      sub.addEventListener('click', close);
+    });
+  });
+}
+
+function paintActiveNav() {
+  const curSub = state.view === 'settings' ? (state.settingTab || 'dict') : null;
+  document.querySelectorAll('#navMenu .nav-item').forEach(i => {
+    const isSub = !!i.dataset.sub;
+    const active = i.dataset.view === state.view && (!isSub || i.dataset.sub === curSub);
+    i.classList.toggle('active', active);
+  });
 }
 
 function bindGlobalMaterialSearch() {
@@ -368,20 +648,22 @@ function bindGlobalMaterialSearch() {
 // 二级导航展开/收起（状态持久化到 localStorage）
 function toggleNavGroup(open) {
   state.navOpen = !!open;
-  document.querySelector('.nav').classList.toggle('nav-open', state.navOpen);
+  // 每个一级分组独立展开，避免打开「系统设置」时把其他自定义分组一起展开
+  const parent = document.querySelector('#navMenu .nav-group:not(.nested) > .nav-parent[data-view="settings"]');
+  parent?.parentElement.classList.toggle('expanded', state.navOpen);
   localStorage.setItem('craft.navOpen', state.navOpen ? '1' : '0');
 }
 
 function switchView(view, sub) {
   state.view = view;
   if (view === 'settings' && sub) state.settingTab = sub;
-  const curSub = view === 'settings' ? (state.settingTab || 'dict') : null;
-  document.querySelectorAll('.nav-item').forEach(i => {
-    const isSub = !!i.dataset.sub;
-    const active = i.dataset.view === view && (!isSub || i.dataset.sub === curSub);
-    i.classList.toggle('active', active);
-  });
-  const titles = { materials: '物料及分组', settings: '系统设置', commit: '提交管理' };  document.getElementById('topbarTitle').textContent = titles[view] || '';
+  paintActiveNav();
+  const titles = {
+    materials: menuLabel('materials'),
+    settings: menuLabel('settings'),
+    commit: menuLabel('commit'),
+  };
+  document.getElementById('topbarTitle').textContent = titles[view] || '';
   render();
 }
 
@@ -389,6 +671,7 @@ function render() {
   const content = document.getElementById('content');
   content.className = 'content';
   content.innerHTML = '';
+  renderNav();   // 菜单配置可能在别处变过（提交、同步），随页面一起重绘
   if (state.view === 'materials') renderMaterialsPage();
   else if (state.view === 'settings') renderSettings();
   else if (state.view === 'commit') renderCommit();
@@ -434,12 +717,16 @@ async function refreshRemote({ awaitIndex = false } = {}) {
     state.cacheNs = ns;
     GH.setCacheContext(ns, head);
 
-    // 三个设置文件、物料清单并行读取；head 未变时直接命中 IndexedDB 缓存，不再下载
-    const [files, materialData] = await Promise.all([
+    // 三个设置文件、菜单配置、物料清单并行读取；head 未变时直接命中 IndexedDB 缓存
+    const [files, menuFile, materialData] = await Promise.all([
       Promise.all(DATA_SETS.map(s => GH.getFile(s.path).then(f => {
         progressAdvance('读取数据…');
         return f;
       }))),
+      GH.getFile(CONFIG.menuPath).then(f => {
+        progressAdvance('读取菜单…');
+        return f;
+      }),
       MaterialStore.loadManifest().then(data => {
         progressAdvance('读取物料清单…');
         return data;
@@ -457,6 +744,8 @@ async function refreshRemote({ awaitIndex = false } = {}) {
       state[s.base] = texts[s.kind] ? safeParse(texts[s.kind], []) : [];
       state[s.raw] = texts[s.kind] || null;
     }
+    state.rawMenuText = menuFile ? menuFile.content : null;
+    state.baseMenu = normalizeMenu(menuFile ? safeParse(menuFile.content, defaultMenuConfig()) : defaultMenuConfig());
     state.missingDataFiles.push(...materialData.missingPaths);
 
     // 上次成功加载的索引先顶上，首屏就能看到计数，不必等大文件下载
@@ -560,6 +849,10 @@ function applyDrafts() {
   }
 
   for (const s of DATA_SETS) state[s.live] = sets[s.kind];
+
+  // 菜单：内置项来自代码，草稿覆盖顺序/显隐/改名/图标并追加自定义项
+  const menuDraft = state.drafts.find(d => d.kind === 'menu');
+  state.menu = normalizeMenu(menuDraft ? menuDraft.data : state.baseMenu);
   state.materials = materials;
 
   // 选中的分组若被删掉则回退到未分组
@@ -668,10 +961,44 @@ function renderMaterialsPage() {
 
   const page = mk('div', { class: 'cat-page' });
   pendingRail = null;
-  page.appendChild(buildTreePanel());
+  const treePanel = buildTreePanel();
+  page.appendChild(treePanel);
+  page.appendChild(buildPanelResizer(treePanel));   // 分组栏可拖宽，深层目录名不被挤掉
   page.appendChild(buildCatMain());
   page.appendChild(pendingRail || buildSideRail());   // 右栏：页面级图标工具栏
   content.appendChild(page);
+}
+
+// 分组栏宽度拖拽：拖动时实时改宽度，松手落 localStorage（下次打开沿用）
+function buildPanelResizer(panel) {
+  const KEY = 'craft.ui.treeWidth';
+  const saved = Number(localStorage.getItem(KEY));
+  if (saved >= 180) panel.style.width = `${saved}px`;
+
+  const grip = mk('div', { class: 'panel-resizer', title: '拖动调整分组栏宽度（双击恢复默认）' });
+  const onMove = (e) => {
+    const w = Math.max(180, Math.min(560, panel._startW + e.clientX - panel._startX));
+    panel.style.width = `${w}px`;
+  };
+  const onUp = () => {
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    document.body.classList.remove('col-resizing');
+    localStorage.setItem(KEY, String(panel.offsetWidth));
+  };
+  grip.addEventListener('mousedown', (e) => {
+    panel._startX = e.clientX;
+    panel._startW = panel.offsetWidth;
+    document.body.classList.add('col-resizing');
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+    e.preventDefault();
+  });
+  grip.addEventListener('dblclick', () => {
+    panel.style.width = '236px';
+    localStorage.setItem(KEY, '236');
+  });
+  return grip;
 }
 
 function buildTreePanel() {
@@ -692,6 +1019,13 @@ function buildTreePanel() {
   addBtn.addEventListener('click', () => openCategoryDialog(null));
   head.appendChild(addBtn);
   panel.appendChild(head);
+
+  // 当前分组只显示自身名称（末级）；完整路径放在悬停提示里
+  const curCat = state.selectedCategoryId && state.selectedCategoryId !== UNGROUPED
+    ? Cat.findCategory(state.categories, state.selectedCategoryId) : null;
+  const curName = curCat ? curCat.name : '未分组';
+  const fullPath = curCat ? Cat.categoryPathString(state.categories, curCat.id) : '未分组（散落在各分组之外的物料）';
+  panel.appendChild(mk('div', { class: 'tree-path', title: fullPath }, curName));
 
   const tree = mk('div', { class: 'tree' });
 
@@ -1008,7 +1342,7 @@ function buildMaterialsPanel(cat) {
   const panel = mk('div', { class: 'tab-panel' });
 
   const bar = mk('div', { class: 'toolbar' });
-  const search = mk('input', { type: 'search', placeholder: state.selectedCategoryId === UNGROUPED ? '搜索未分组及异常分组物料：物料编码 / 名称' : '搜索当前分类：物料编码 / 名称' });
+  const search = mk('input', { type: 'search', placeholder: state.selectedCategoryId === UNGROUPED ? '搜索当前分类：物料编码 / 名称' : '搜索当前分类：物料编码 / 名称' });
   search.value = state.search;
   let searchTimer = null;
   search.addEventListener('input', e => {
@@ -1025,13 +1359,33 @@ function buildMaterialsPanel(cat) {
   if (state.checked.size) {
     bar.appendChild(mk('span', { class: 'hint' }, `已选 ${state.checked.size} 项`));
   }
-  const pagination = mk('div', { class: 'materials-pagination', id: 'materialsPagination' });
-  bar.appendChild(pagination);
   panel.appendChild(bar);
 
+  // 视图切换：工具栏底部右侧，列表 / 表格
+  const viewBar = mk('div', { class: 'view-bar' });
+  const viewSwitch = mk('div', { class: 'view-switch' });
+  for (const [id, label] of [['list', '列表'], ['sheet', '表格']]) {
+    const btn = mk('button', { class: 'view-btn' + (state.materialView === id ? ' active' : '') }, label);
+    btn.addEventListener('click', () => {
+      if (state.materialView === id) return;
+      state.materialView = id;
+      localStorage.setItem('craft.materials.view', id);
+      render();
+    });
+    viewSwitch.appendChild(btn);
+  }
+  viewBar.appendChild(viewSwitch);
+  panel.appendChild(viewBar);
+
   const body = mk('div', { class: 'materials-body' });
+  const main = mk('div', { class: 'materials-main' });
   const tableWrap = mk('div', { class: 'table-wrap', id: 'materialsTableWrap' });
-  body.appendChild(tableWrap);
+  main.appendChild(tableWrap);
+  // 翻页控件固定在内容区右下角，不再占用顶部工具栏
+  const footer = mk('div', { class: 'materials-footer' });
+  footer.appendChild(mk('div', { class: 'materials-pagination', id: 'materialsPagination' }));
+  main.appendChild(footer);
+  body.appendChild(main);
   panel.appendChild(body);
 
   refreshMaterialsTable(panel, cat);
@@ -1088,6 +1442,8 @@ async function renderMaterialsTable(panel, cat) {
   const pagination = panel.querySelector('#materialsPagination');
   if (!wrap) return;
   const seq = ++state.materialViewSeq;
+  if (state.sheetApi) { state.sheetApi.destroy(); state.sheetApi = null; }
+  wrap.classList.remove('sheet-wrap');
   wrap.innerHTML = '';
   wrap.appendChild(mk('div', { class: 'empty', style: 'padding:24px;' }, '加载中…'));
   if (pagination) pagination.innerHTML = '';
@@ -1138,6 +1494,13 @@ async function renderMaterialsTable(panel, cat) {
     pagination.appendChild(prev);
     pagination.appendChild(mk('span', { class: 'page-info' }, `第 ${state.materialPage} / ${totalPages} 页`));
     pagination.appendChild(next);
+  }
+
+  // 表格视图：同一批数据，改为可编辑的电子表格
+  if (state.materialView === 'sheet') {
+    await renderSheetView(wrap, list, cat);
+    if (seq !== state.materialViewSeq) return;
+    return;
   }
 
   const table = mk('table', { class: 'grid' });
@@ -1239,9 +1602,102 @@ async function renderMaterialsTable(panel, cat) {
   }
 }
 
+// ---------- 表格视图（电子表格内核） ----------
+const SHEET_TYPES = {
+  text: 'text', textarea: 'text', number: 'number', select: 'select', radio: 'select',
+  multiselect: 'multiselect', range: 'range', date: 'date', checkbox: 'bool',
+};
+
+// 属性列在表格里的 key 加前缀，避免和编码/名称等固定列冲突
+const ATTR_PREFIX = 'attr_';
+
+async function renderSheetView(wrap, list, cat) {
+  wrap.classList.add('sheet-wrap');
+  wrap.innerHTML = '';
+  wrap.appendChild(mk('div', { class: 'empty', style: 'padding:24px;' }, '加载中…'));
+
+  const records = await hydrateMaterials(list);
+  const byId = new Map(records.map(m => [m.id, m]));
+  const defs = cat && cat.isLeaf ? fieldsOf(attrsOf(cat)) : [];
+
+  const columns = [
+    { key: 'code', label: '物料编码', readonly: true, freeze: true, width: 150 },
+    { key: 'name', label: '物料名称', width: 220 },
+    ...defs.map(def => ({
+      key: ATTR_PREFIX + def.key,
+      label: def.label || def.key,
+      type: SHEET_TYPES[def.type] || 'text',
+      width: def.type === 'textarea' ? 220 : 140,
+      required: !!def.required,
+      options: (def.options || []).map(v => ({ value: v, label: def.optionsLabels?.[v] || v })),
+    })),
+    { key: '__status', label: '保存状态', readonly: true, width: 100 },
+    { key: '__time', label: '最近编辑时间', readonly: true, width: 150 },
+    { key: '__by', label: '编辑人', readonly: true, width: 110 },
+  ];
+
+  const draftIds = () => new Set(state.drafts.filter(d => d.kind === 'material').map(d => d.recordId));
+  let pending = draftIds();
+  const rows = records.map(mat => {
+    const values = { code: mat.code || '待提交', name: mat.name || '' };
+    for (const def of defs) values[ATTR_PREFIX + def.key] = mat.attrs?.[def.key] ?? '';
+    values.__status = pending.has(mat.id) ? '未保存' : '已保存';
+    values.__time = fmtTime(mat.updatedAt);
+    values.__by = mat.updatedBy || '';
+    return { _id: mat.id, values };
+  });
+
+  wrap.innerHTML = '';
+  const host = mk('div', { class: 'sheet-host' });
+  wrap.appendChild(host);
+  state.sheetApi = createSheet(host, {
+    columns,
+    rows,
+    features: { toolbar: false, search: false, log: false, export: false },
+    onChange: (patches) => saveSheetEdits(patches, byId, draftIds),
+  });
+  state.sheetApi.paint();
+}
+
+// 单元格编辑 → 物料草稿；保存状态列同步刷新
+async function saveSheetEdits(patches, byId, draftIds) {
+  const touched = new Set();
+  for (const p of patches) {
+    const mat = byId.get(p.rowId);
+    if (!mat) continue;
+    const key = String(p.key);
+    if (key === 'name') {
+      const name = String(p.next ?? '').trim();
+      if (!name) { toastErr('物料名称不能为空'); continue; }
+      mat.name = name;
+    } else if (key.startsWith(ATTR_PREFIX)) {
+      mat.attrs = { ...(mat.attrs || {}), [key.slice(ATTR_PREFIX.length)]: p.next };
+    } else {
+      continue;
+    }
+    mat.updatedAt = nowISO();
+    mat.updatedBy = state.user?.login || mat.updatedBy || '';
+    touched.add(mat);
+  }
+  for (const mat of touched) {
+    const existing = draftOf('material', mat.id);
+    await saveMaterialDraft(mat, existing ? existing.op : 'update');
+  }
+  const api = state.sheetApi;
+  if (!api) return;
+  const pending = draftIds();
+  for (const row of api.getRows()) {
+    const mat = byId.get(row._id);
+    if (!mat) continue;
+    row.values.__status = pending.has(mat.id) ? '未保存' : '已保存';
+    row.values.__time = fmtTime(mat.updatedAt);
+    row.values.__by = mat.updatedBy || '';
+  }
+  api.paint();
+}
+
 // 保存状态：已保存=与仓库一致，未保存=还有未提交的本地改动
-function buildLocationCell(m) {
-  // 所属分组缺失或已非末级：物料在分组树里看不到，状态直接标红提示
+function buildLocationCell(m) {  // 所属分组缺失或已非末级：物料在分组树里看不到，状态直接标红提示
   if (m.categoryId && isLooseCategory(m.categoryId)) {
     const span = mk('span', { class: 'loc warn', title: '所属分组已不存在或不是末级分组', style: 'color:var(--danger);' });
     span.appendChild(mk('i', { class: 'dot', style: 'background:var(--danger);' }));
@@ -2290,15 +2746,26 @@ function renderSettings() {
 
   if (!state.settingTab) state.settingTab = 'dict';
   pendingRail = null;
-  content.appendChild(state.settingTab === 'dict' ? buildDictionarySection() : buildAttrSetSection());
+  const titles = { dict: '字典设置', set: '属性集合', menu: '菜单管理' };
+  const tips = {
+    dict: '字典是给「下拉单选 / 单选 / 多选」类型属性提供选项的选项库，改一次所有引用它的字段一起生效。',
+    set: '属性集合是一整套属性模板：在分组管理里「关联」后，该分组的物料属性由集合实时提供，改集合一次全部生效。',
+    menu: '内置菜单由系统提供，不能删除，但可以调整顺序、显隐、名称与图标；自定义菜单可以指向站内页面或外部网址。改动先存为草稿，提交后写入 data/menu.json。',
+  };
+  const builders = { dict: buildDictionarySection, set: buildAttrSetSection, menu: buildMenuSection };
+  const tab = state.settingTab;
+  const block = (builders[tab] || buildDictionarySection)();
+  const titleRow = mk('div', { class: 'setting-title-row' });
+  titleRow.appendChild(mk('div', { class: 'setting-title' }, titles[tab] || '字典设置'));
+  titleRow.appendChild(infoTip(tips[tab] || ''));
+  block.insertBefore(titleRow, block.firstChild);
+  content.appendChild(block);
   if (pendingRail) content.appendChild(pendingRail);   // 右栏：图标工具栏
 }
 
 // ----- 字典设置 -----
 function buildDictionarySection() {
   const wrap = mk('div', { class: 'setting-block' });
-  wrap.appendChild(mk('div', { class: 'hint' },
-    '字典是给「下拉单选 / 单选 / 多选」类型属性提供选项的选项库，改一次所有引用它的字段一起生效。'));
 
   const bar = mk('div', { class: 'toolbar' });
   const search = mk('input', { type: 'search', placeholder: '搜索字典名称 / 选项' });
@@ -2381,7 +2848,8 @@ function buildDictionarySection() {
 }
 
 // 设置类页面右侧操作栏：新建 / 编辑 / 复制 / 删除（后三项需选中 1 项）
-function buildSettingRail({ label, count, onNew, onEdit, onCopy, onDelete }) {
+// 传 onUp/onDown 时改为「新建 / 上移 / 下移 / 删除」，用于菜单管理这类需要排序的列表
+function buildSettingRail({ label, count, onNew, onEdit, onCopy, onUp, onDown, onDelete }) {
   const rail = mk('div', { class: 'side-rail' });
   const sep = () => mk('div', { class: 'rail-sep' });
   const one = count === 1;
@@ -2389,22 +2857,35 @@ function buildSettingRail({ label, count, onNew, onEdit, onCopy, onDelete }) {
   const add = mk('button', { class: 'rail-btn', title: `新建${label}` }, '＋');
   add.addEventListener('click', onNew);
 
-  const edit = mk('button', { class: 'rail-btn', title: `编辑${label}（先勾选 1 项）` }, '✎');
-  edit.disabled = !one;
-  edit.addEventListener('click', onEdit);
-
-  const copy = mk('button', { class: 'rail-btn', title: `复制${label}（先勾选 1 项）` }, '⧉');
-  copy.disabled = !one;
-  copy.addEventListener('click', onCopy);
-
   const del = mk('button', { class: 'rail-btn danger-hover', title: `删除${label}（先勾选 1 项）` }, '✕');
   del.disabled = !one;
   del.addEventListener('click', onDelete);
 
   rail.appendChild(add);
   rail.appendChild(sep());
-  rail.appendChild(edit);
-  rail.appendChild(copy);
+
+  if (onUp || onDown) {
+    const up = mk('button', { class: 'rail-btn', title: `上移${label}（先勾选 1 项）` }, '↑');
+    up.disabled = !one;
+    up.addEventListener('click', onUp);
+    const down = mk('button', { class: 'rail-btn', title: `下移${label}（先勾选 1 项）` }, '↓');
+    down.disabled = !one;
+    down.addEventListener('click', onDown);
+    rail.appendChild(up);
+    rail.appendChild(down);
+  } else {
+    const edit = mk('button', { class: 'rail-btn', title: `编辑${label}（先勾选 1 项）` }, '✎');
+    edit.disabled = !one;
+    edit.addEventListener('click', onEdit);
+    rail.appendChild(edit);
+    if (onCopy) {
+      const copy = mk('button', { class: 'rail-btn', title: `复制${label}（先勾选 1 项）` }, '⧉');
+      copy.disabled = !one;
+      copy.addEventListener('click', onCopy);
+      rail.appendChild(copy);
+    }
+  }
+
   rail.appendChild(sep());
   rail.appendChild(del);
   return rail;
@@ -2553,8 +3034,6 @@ async function doDeleteDictionary(dict, usedBy) {
 // ----- 属性集合 -----
 function buildAttrSetSection() {
   const wrap = mk('div', { class: 'setting-block' });
-  wrap.appendChild(mk('div', { class: 'hint' },
-    '属性集合是一整套属性模板：在分组管理里「关联」后，该分组的物料属性由集合实时提供，改集合一次全部生效。'));
 
   const bar = mk('div', { class: 'toolbar' });
   const search = mk('input', { type: 'search', placeholder: '搜索集合名称 / 属性' });
@@ -2708,9 +3187,10 @@ function renderCommit() {  const content = document.getElementById('content');
   content.className = 'content scroll';
   content.innerHTML = '';
 
-  content.appendChild(mk('h2', { style: 'margin:0 0 4px;font-size:15px;' }, '提交管理'));
-  content.appendChild(mk('p', { class: 'muted', style: 'margin:0 0 16px;font-size:12px;' },
-    '所有改动先暂存在浏览器（IndexedDB），勾选后一次性提交到数据仓库；提交成功后自动清空已提交的草稿。'));
+  const titleRow = mk('div', { class: 'setting-title-row', style: 'margin-bottom:16px' });
+  titleRow.appendChild(mk('div', { class: 'setting-title' }, '提交管理'));
+  titleRow.appendChild(infoTip('所有改动先暂存在浏览器（IndexedDB），勾选后一次性提交到数据仓库；提交成功后自动清空已提交的草稿。'));
+  content.appendChild(titleRow);
 
   // 当前账号与数据仓库
   const repoSection = mk('div', { class: 'section' });
@@ -2837,6 +3317,374 @@ async function rebuildSearchIndex(btn) {
   }
 }
 
+// ---------- 系统设置：菜单管理 ----------
+// 内置菜单写在代码里，data/menu.json 只记录顺序、显隐、名称、图标与自定义项
+async function saveMenuConfig(next, { rerender = false } = {}) {
+  const normalized = normalizeMenu(next);
+  const base = normalizeMenu(state.baseMenu || defaultMenuConfig());
+  if (JSON.stringify(normalized) === JSON.stringify(base)) {
+    // 与远端一致就不留草稿，避免提交管理里出现空改动
+    await Store.removeDraft('menu', 'nav');
+  } else {
+    await Store.putDraft({
+      id: 'menu:nav',
+      kind: 'menu',
+      recordId: 'nav',
+      op: 'update',
+      data: clone(normalized),
+    });
+  }
+  await loadDrafts();
+  renderNav();
+  if (rerender) render();
+}
+
+async function updateMenuOverride(key, patch) {
+  const next = clone(state.menu);
+  const cur = { ...(next.overrides[key] || {}), ...patch };
+  for (const k of Object.keys(cur)) if (cur[k] === undefined || cur[k] === '') delete cur[k];
+  if (Object.keys(cur).length) next.overrides[key] = cur;
+  else delete next.overrides[key];
+  await saveMenuConfig(next, { rerender: true });
+}
+
+// 菜单所在的上级：空串 = 一级导航
+function findMenuParent(menu, key) {
+  if (menu.order.includes(key)) return '';
+  return Object.keys(menu.children).find(p => menu.children[p].includes(key)) || '';
+}
+
+function detachMenuKey(menu, key) {
+  menu.order = menu.order.filter(k => k !== key);
+  for (const parent of Object.keys(menu.children)) {
+    menu.children[parent] = menu.children[parent].filter(k => k !== key);
+  }
+}
+
+function appendMenuKey(menu, key, parent) {
+  if (!parent) menu.order.push(key);
+  else (menu.children[parent] = menu.children[parent] || []).push(key);
+}
+
+async function moveMenuKey(key, delta, parent) {
+  const next = clone(state.menu);
+  const list = parent === '' ? next.order : next.children[parent];
+  if (!list) return;
+  const i = list.indexOf(key);
+  const j = i + delta;
+  if (i < 0 || j < 0 || j >= list.length) return;
+  [list[i], list[j]] = [list[j], list[i]];
+  await saveMenuConfig(next, { rerender: true });
+}
+
+async function removeCustomMenu(id) {
+  const custom = state.menu.custom.find(c => c.id === id);
+  if (!custom) { toastErr('内置菜单不能删除，只能隐藏'); return; }
+  if (!(await confirm(`删除自定义菜单「${custom.label || '未命名'}」？`, '删除菜单'))) return;
+  const next = clone(state.menu);
+  next.custom = next.custom.filter(c => c.id !== id);
+  next.order = next.order.filter(k => k !== id);
+  for (const parent of Object.keys(next.children)) {
+    next.children[parent] = next.children[parent].filter(k => k !== id);
+  }
+  delete next.overrides[id];
+  state.menuChecked.delete(id);
+  await saveMenuConfig(next, { rerender: true });
+  toastOk('已删除菜单（草稿）');
+}
+
+async function resetMenuConfig() {
+  if (!(await confirm('恢复默认菜单？当前的顺序、显隐、名称、图标与自定义菜单都会被撤销。'))) return;
+  state.menuChecked.clear();
+  await saveMenuConfig(defaultMenuConfig(), { rerender: true });
+  toastOk('已恢复默认菜单');
+}
+
+// 新增 / 编辑菜单共用一个弹窗，字段固定：名称 / 上级菜单 / 图标 / 地址 / 打开方式 / 显示
+// 内置菜单的上级、地址、打开方式固定不可改；子菜单没有图标；菜单管理自身不能隐藏
+function openMenuDialog(key = null) {
+  const isNew = !key;
+  const builtinParent = key && NAV_BUILTINS[key] ? 'main'
+    : key && NAV_BUILTINS.settings.children[key] ? 'child' : null;
+  const builtin = builtinParent === 'child' ? NAV_BUILTINS.settings.children[key]
+    : builtinParent === 'main' ? NAV_BUILTINS[key] : null;
+  const custom = key ? state.menu.custom.find(c => c.id === key) : null;
+
+  // 层级：1 一级、2 二级、3 三级；自定义菜单可以挂到任意未满三级的菜单下
+  const levelOf = (id) => {
+    let level = 1;
+    const guard = new Set([id]);
+    let p = findMenuParent(state.menu, id);
+    while (p && !guard.has(p)) { guard.add(p); level += 1; p = findMenuParent(state.menu, p); }
+    return level;
+  };
+  const subtreeHeight = (id) => 1 + Math.max(0, ...(state.menu.children[id] || []).map(subtreeHeight));
+  const isDescendant = (candidate, ancestor) =>
+    (state.menu.children[ancestor] || []).some(k => k === candidate || isDescendant(candidate, k));
+  const currentParent = key ? findMenuParent(state.menu, key) : '';
+  const initialParent = builtinParent === 'child' ? 'settings' : builtinParent === 'main' ? '' : currentParent;
+  let icon = custom?.icon || builtin?.icon || '↗';
+
+  const body = mk('div', { class: 'menu-form' });
+  const addRow = (label, ...nodes) => {
+    const row = mk('div', { class: 'menu-form-row' });
+    row.appendChild(mk('span', { class: 'menu-form-label' }, label));
+    nodes.forEach(n => row.appendChild(n));
+    body.appendChild(row);
+    return row;
+  };
+
+  const nameInput = mk('input', { type: 'text', placeholder: '菜单名称，如「帮助文档」', maxLength: 12 });
+  nameInput.value = isNew ? '' : (custom ? custom.label : menuLabel(key));
+  addRow('名称', nameInput);
+
+  // 上级菜单：内置菜单固定；自定义菜单最多挂到三级
+  const parentSelect = mk('select');
+  parentSelect.appendChild(mk('option', { value: '' }, '主导航'));
+  parentSelect.appendChild(mk('option', { value: 'settings' }, '系统设置'));
+  const selfHeight = key ? subtreeHeight(key) : 1;
+  for (const item of state.menu.custom) {
+    if (!item.id || item.id === key) continue;
+    if (key && isDescendant(item.id, key)) continue;
+    if (item.id !== currentParent && levelOf(item.id) + selfHeight > 3) continue;
+    parentSelect.appendChild(mk('option', { value: item.id }, item.label || '未命名'));
+  }
+  // 当前上级一定要在下拉里，否则编辑时会显示空白
+  if (currentParent && ![currentParent, 'settings'].includes(currentParent)
+    && !Array.from(parentSelect.options).some(o => o.value === currentParent)) {
+    parentSelect.appendChild(mk('option', { value: currentParent }, menuLabel(currentParent)));
+  }
+  parentSelect.value = initialParent;
+  parentSelect.disabled = !!builtin;
+  addRow('上级菜单', parentSelect);
+
+  // 图标：子菜单在导航里不显示图标，禁用但保持同一布局
+  const iconGrid = mk('div', { class: 'icon-picker-grid' });
+  const paintGrid = () => iconGrid.querySelectorAll('.icon-picker-item')
+    .forEach(b => b.classList.toggle('active', b.textContent === icon));
+  for (const candidate of NAV_ICONS) {
+    const btn = mk('button', { class: 'icon-picker-item', type: 'button', title: candidate }, candidate);
+    btn.addEventListener('click', () => { icon = candidate; paintGrid(); });
+    iconGrid.appendChild(btn);
+  }
+  const syncIconState = () => {
+    const isChildRow = parentSelect.value !== '';
+    iconGrid.classList.toggle('disabled', isChildRow);
+  };
+  parentSelect.addEventListener('change', syncIconState);
+  syncIconState();
+  addRow('图标', iconGrid);
+  paintGrid();
+
+  // 地址：内置页面只读，新增/自定义菜单可填路径或网址
+  const hrefEditable = isNew || !!custom;
+  const hrefInput = mk('input', { type: 'text', placeholder: 'cons.html / https://example.com' });
+  hrefInput.value = custom ? (custom.href || '') : (builtin ? (builtin.href || '内置页面') : '');
+  hrefInput.disabled = !hrefEditable;
+  addRow('地址', hrefInput);
+
+  // 打开方式：只有新增/自定义菜单可选
+  const newTabWrap = mk('label', { class: 'checkbox-label' });
+  const newTab = mk('input', { type: 'checkbox' });
+  newTab.checked = custom ? custom.newTab !== false : !!builtin?.newTab;
+  newTab.disabled = !hrefEditable;
+  newTabWrap.appendChild(newTab);
+  newTabWrap.appendChild(document.createTextNode(' 在新窗口打开'));
+  addRow('打开方式', newTabWrap);
+
+  // 显示：菜单管理自身锁定为始终显示
+  const visWrap = mk('label', { class: 'checkbox-label' });
+  const vis = mk('input', { type: 'checkbox' });
+  vis.checked = isNew ? true : (custom ? custom.visible !== false : menuVisible(key));
+  vis.disabled = !!builtin?.locked;
+  visWrap.appendChild(vis);
+  visWrap.appendChild(document.createTextNode(' 在导航中显示'));
+  addRow('显示', visWrap);
+
+  openModal({
+    title: isNew ? '新增自定义菜单' : '编辑菜单',
+    body,
+    actions: [
+      { label: '取消', onClick: closeModal },
+      {
+        label: isNew ? '添加' : '保存',
+        className: 'primary',
+        onClick: async () => {
+          const label = nameInput.value.trim();
+          if (!label) { toastErr('请填写菜单名称'); return; }
+          const parentValue = parentSelect.value;
+          if (isNew || custom) {
+            // 地址可以留空：只作为分组使用，点击没有跳转
+            const href = hrefInput.value.trim();
+            const next = clone(state.menu);
+            if (isNew) {
+              const id = mint('menu');
+              next.custom.push({ id, label, href, icon, newTab: newTab.checked });
+              appendMenuKey(next, id, parentValue);
+            } else {
+              const target = next.custom.find(c => c.id === key);
+              target.label = label;
+              target.href = href;
+              target.icon = icon;
+              if (newTab.checked) delete target.newTab; else target.newTab = false;
+              if (vis.checked) delete target.visible; else target.visible = false;
+              if (findMenuParent(next, key) !== parentValue) {
+                detachMenuKey(next, key);
+                appendMenuKey(next, key, parentValue);
+              }
+            }
+            await saveMenuConfig(next, { rerender: true });
+          } else {
+            const patch = { label, visible: vis.checked ? undefined : false };
+            if (builtinParent !== 'child') patch.icon = icon;
+            await updateMenuOverride(key, patch);
+          }
+          closeModal();
+          toastOk(isNew ? `已新增菜单「${label}」` : '菜单已更新（草稿）');
+        },
+      },
+    ],
+  });
+}
+
+// 菜单行：按层级展开，parent 为空串表示一级导航
+function menuRowList() {
+  const rows = [];
+  const walk = (keys, parent) => {
+    for (const key of keys) {
+      rows.push({ key, parent });
+      walk(state.menu.children[key] || [], key);
+    }
+  };
+  walk(state.menu.order, '');
+  return rows;
+}
+
+// 与「字典设置」同一套页面结构：工具栏（搜索 + 数量）+ 表格 + 右栏操作
+function buildMenuSection() {
+  const wrap = mk('div', { class: 'setting-block' });
+
+  const bar = mk('div', { class: 'toolbar' });
+  const search = mk('input', { type: 'search', placeholder: '搜索菜单名称 / 地址' });
+  search.value = state.menuSearch || '';
+  bar.appendChild(search);
+  const info = mk('span', { class: 'hint' });
+  bar.appendChild(info);
+  const resetBtn = mk('button', { class: 'btn small', style: 'margin-left:auto;' }, '恢复默认');
+  resetBtn.addEventListener('click', resetMenuConfig);
+  bar.appendChild(resetBtn);
+  wrap.appendChild(bar);
+
+  const tableWrap = mk('div', { class: 'table-wrap' });
+  wrap.appendChild(tableWrap);
+
+  const selected = () => Array.from(state.menuChecked)
+    .map(key => menuRowList().find(row => row.key === key)).filter(Boolean);
+
+  pendingRail = buildSettingRail({
+    label: '菜单',
+    count: state.menuChecked.size,
+    onNew: () => openMenuDialog(null),
+    onUp: () => {
+      const sel = selected()[0];
+      if (sel) moveMenuKey(sel.key, -1, sel.parent);
+    },
+    onDown: () => {
+      const sel = selected()[0];
+      if (sel) moveMenuKey(sel.key, 1, sel.parent);
+    },
+    onDelete: () => { const sel = selected()[0]; if (sel) removeCustomMenu(sel.key); },
+  });
+
+  const renderTable = () => {
+    const kw = (state.menuSearch || '').trim().toLowerCase();
+    const rows = menuRowList();
+    const list = rows.filter(({ key }) => {
+      if (!kw) return true;
+      const custom = state.menu.custom.find(c => c.id === key);
+      return `${menuLabel(key)} ${custom?.href || ''}`.toLowerCase().includes(kw);
+    });
+    tableWrap.innerHTML = '';
+    info.textContent = `共 ${list.length} 个`;
+    if (!list.length) {
+      tableWrap.appendChild(mk('div', { class: 'empty', style: 'padding:24px;' },
+        kw ? '没有匹配的菜单' : '还没有菜单'));
+      return;
+    }
+
+    const table = mk('table', { class: 'grid' });
+    const head = mk('tr');
+    ['', '图标', '菜单名称', '所属', '地址 / 类型', '显示', '操作'].forEach((t, i) => {
+      const th = mk('th', {}, t);
+      if (i === 6) th.className = 'col-ops';
+      head.appendChild(th);
+    });
+    table.appendChild(head);
+
+    for (const { key, parent } of list) {
+      const isChild = !!parent;
+      const builtin = NAV_BUILTINS[key] || NAV_BUILTINS.settings.children[key] || null;
+      const custom = builtin ? null : state.menu.custom.find(c => c.id === key);
+      const locked = !!builtin?.locked;
+      const tr = mk('tr');
+
+      const cb = mk('input', { type: 'checkbox' });
+      cb.checked = state.menuChecked.has(key);
+      cb.addEventListener('change', () => {
+        state.menuChecked.delete(key);
+        if (cb.checked) state.menuChecked.add(key);
+        render();
+      });
+      const chkTd = mk('td');
+      chkTd.appendChild(cb);
+      tr.appendChild(chkTd);
+
+      tr.appendChild(mk('td', {}, isChild ? '—' : menuIcon(key)));
+      tr.appendChild(mk('td', { class: 'plain' }, custom ? custom.label : menuLabel(key)));
+      const parentLabel = parent === '' ? '主导航'
+        : parent === 'settings' ? '系统设置' : menuLabel(parent);
+      tr.appendChild(mk('td', {}, parentLabel));
+      tr.appendChild(mk('td', { class: 'wrap' }, custom ? (custom.href || '—') : (builtin?.href || '内置页面')));
+      const visible = custom ? custom.visible !== false : menuVisible(key);
+      tr.appendChild(mk('td', { class: 'plain' }, locked ? '始终显示' : (visible ? '显示' : '隐藏')));
+
+      // 操作列：编辑 / 删除；内置菜单不可删除
+      const ops = mk('td', { class: 'col-ops' });
+      const edit = mk('button', { class: 'link-btn', type: 'button' }, '编辑');
+      edit.addEventListener('click', () => openMenuDialog(key));
+      ops.appendChild(edit);
+      if (custom) {
+        const del = mk('button', { class: 'link-btn danger', type: 'button' }, '删除');
+        del.addEventListener('click', () => removeCustomMenu(key));
+        ops.appendChild(del);
+      }
+      tr.appendChild(ops);
+      table.appendChild(tr);
+    }
+
+    // 底部固定项：返回官网，与上方菜单用分隔线区分
+    if (!kw || NAV_FOOTER.label.includes(kw)) {
+      const tr = mk('tr');
+      tr.appendChild(mk('td'));
+      tr.appendChild(mk('td', {}, NAV_FOOTER.icon));
+      tr.appendChild(mk('td', { class: 'plain' }, NAV_FOOTER.label));
+      tr.appendChild(mk('td', {}, '导航底部'));
+      tr.appendChild(mk('td', { class: 'wrap' }, NAV_FOOTER.href));
+      tr.appendChild(mk('td', { class: 'plain' }, '固定'));
+      const ops = mk('td', { class: 'col-ops' });
+      ops.appendChild(mk('span', { class: 'menu-lock' }, '固定'));
+      tr.appendChild(ops);
+      table.appendChild(tr);
+    }
+
+    tableWrap.appendChild(table);
+  };
+
+  search.addEventListener('input', () => { state.menuSearch = search.value; renderTable(); });
+  renderTable();
+  return wrap;
+}
+
 function draftLabel(d) {
   const opText = { add: '新增', update: '修改', delete: '删除' }[d.op] || d.op;
   if (d.kind === 'category') {
@@ -2847,6 +3695,9 @@ function draftLabel(d) {
   }
   if (d.kind === 'attrSet') {
     return `【属性集合】${opText} ${d.data?.name || d.recordId}（${d.data?.attrs?.length || 0} 个属性）`;
+  }
+  if (d.kind === 'menu') {
+    return '【菜单】调整导航菜单（顺序 / 显隐 / 名称 / 图标 / 自定义项）';
   }
   const catName = d.data?.categoryId ? Cat.categoryPathString(state.categories, d.data.categoryId) : '';
   return `【物料】${opText} ${d.data?.code || '待提交'}${d.data?.name ? ' ' + d.data.name : ''}${catName ? '（' + catName + '）' : ''}`;
@@ -2888,6 +3739,12 @@ async function buildCommitPayload(selectedDrafts, includeInit) {
       fileChanges.push({ path: s.path, content: text });
     }
   }
+  const menuDraft = selectedDrafts.find(d => d.kind === 'menu');
+  if (menuDraft) {
+    const text = JSON.stringify(normalizeMenu(menuDraft.data), null, 2) + '\n';
+    if (text !== state.rawMenuText) fileChanges.push({ path: CONFIG.menuPath, content: text });
+  }
+
   const materialPayload = await MaterialStore.buildCommitPayload(selectedDrafts, now, includeInit);
   return {
     fileChanges: fileChanges.concat(materialPayload.fileChanges),
@@ -2908,6 +3765,12 @@ async function applyCommittedPayload(payload, commitSha) {
     if (!change) continue;
     state[s.raw] = change.content;
     state[s.base] = safeParse(change.content, []);
+  }
+
+  const menuChange = changes.get(CONFIG.menuPath);
+  if (menuChange) {
+    state.rawMenuText = menuChange.content;
+    state.baseMenu = normalizeMenu(safeParse(menuChange.content, defaultMenuConfig()));
   }
 
   state.baseMaterials = await MaterialStore.applyCommitPayload(payload);
