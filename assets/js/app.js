@@ -60,8 +60,8 @@ const state = {
   materialPage: 1,
   materialPageSize: 20,
   materialViewSeq: 0,
-  // 物料档案的展示形态：list（列表）/ sheet（表格，可在单元格内直接编辑）
-  materialView: localStorage.getItem('craft.materials.view') === 'sheet' ? 'sheet' : 'list',
+  // 物料档案的展示形态：list（列表）/ sheet（表格，可在单元格内直接编辑）；每次进入默认列表视图
+  materialView: 'list',
   sheetApi: null,
   dictChecked: new Set(),     // 字典设置页勾选
   setChecked: new Set(),      // 属性集合页勾选
@@ -1421,7 +1421,6 @@ function buildSideRail() {
   }, sheetMode ? '☰' : '▦');
   viewToggle.addEventListener('click', () => {
     state.materialView = sheetMode ? 'list' : 'sheet';
-    localStorage.setItem('craft.materials.view', state.materialView);
     render();
   });
   rail.appendChild(viewToggle);
