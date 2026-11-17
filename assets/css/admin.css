@@ -363,24 +363,24 @@ body.col-resizing { cursor: col-resize; user-select: none; }
 }
 .toolbar .hint { font-size: 12px; color: var(--text-muted); }
 .materials-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-.materials-footer { display: flex; justify-content: flex-end; padding: 6px 12px 8px 0; }
+.materials-footer { display: flex; align-items: center; justify-content: flex-end; gap: 12px; padding: 6px 12px 8px 0; }
 .materials-pagination { display: flex; align-items: center; gap: 6px; }
 .materials-pagination .page-info { min-width: 74px; text-align: center; font-size: 12px; color: var(--text-muted); }
 
-/* 物料档案：视图切换（列表 / 表格） */
-.view-bar { display: flex; justify-content: flex-end; padding-bottom: 6px; }
-.view-switch { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
-.view-btn {
-  border: 0; background: var(--surface); color: var(--text-muted);
-  font-size: 12px; padding: 4px 12px; cursor: pointer;
-}
-.view-btn + .view-btn { border-left: 1px solid var(--border); }
-.view-btn.active { background: var(--hover); color: var(--text); font-weight: 600; }
+/* 物料档案：视图切换图标放在右侧工具栏底部，复用 .rail-btn 样式 */
 
 /* 表格视图：内核自己滚动，外层不再滚动 */
 .table-wrap.sheet-wrap { overflow: hidden; }
 .sheet-host { height: 100%; min-height: 0; display: flex; }
 .sheet-host .sc-root { padding: 0; }
+/* 表格视图字号与列表视图对齐：表头 12px 弱化色，内容 12px 等宽弱化色 */
+.sheet-wrap .sc-table th { font-size: 12px; color: var(--text-muted); }
+.sheet-wrap .sc-table td { font-size: 12px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; color: var(--text-muted); }
+/* 勾选列：与列表视图的复选框保持一致，水平居中 */
+.sheet-wrap .sc-table th:has(.sheet-chk-all),
+.sheet-wrap .sc-table td:has(.sheet-chk) { text-align: center; padding: 0; vertical-align: middle; }
+.sheet-wrap .sc-table th .sheet-chk-all,
+.sheet-wrap .sc-table td .sheet-chk { margin: 0; cursor: pointer; vertical-align: middle; }
 
 /* ========= 表格 ========= */
 .table-wrap {
@@ -422,7 +422,7 @@ table.grid th.col-name, table.grid td.col-name,
 table.grid th.col-ops, table.grid td.col-ops { position: sticky; z-index: 3; background: var(--surface); }
 table.grid th.col-chk, table.grid td.col-chk { left: 0; width: 36px; }
 table.grid th.col-code, table.grid td.col-code {
-  width: 140px; max-width: 140px; overflow: hidden; text-overflow: ellipsis;
+  width: 120px; max-width: 120px; overflow: hidden; text-overflow: ellipsis;
 }
 table.grid th.col-name, table.grid td.col-name {
   width: 200px; max-width: 200px; overflow: hidden; text-overflow: ellipsis;

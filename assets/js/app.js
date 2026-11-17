@@ -23,7 +23,7 @@ import * as Cat from './categories.js';
 import * as Excel from './excel.js';
 import * as MaterialStore from './material-store.js';
 import { renderForm, renderAttrDefTable, mk } from './fields.js';
-import { createSheet } from './sheet-core.js';
+import { createSheet, showHoverTip, hideHoverTip } from './sheet-core.js';
 import { openModal, closeModal, toastOk, toastErr, confirm, toast } from './ui.js';
 
 // ---------- 全局状态 ----------
@@ -1109,7 +1109,6 @@ function buildTreeNode(opts) {
   const node = mk('div', {
     class: 'tree-node' + (opts.active ? ' active' : '') + (opts.isRoot ? ' is-root' : ''),
     style: `--depth:${opts.depth}`,
-    title: opts.label,
   });
 
   const caret = mk('span', { class: 'caret' + (opts.hasKids ? '' : ' hidden-caret') },
@@ -1117,7 +1116,13 @@ function buildTreeNode(opts) {
   if (opts.hasKids) caret.addEventListener('click', opts.onCaret);
   node.appendChild(caret);
 
-  node.appendChild(mk('span', { class: 'tree-label' }, opts.label));
+  const labelEl = mk('span', { class: 'tree-label' }, opts.label);
+  node.appendChild(labelEl);
+  // 分组名被截断时，悬停一会儿浮出完整名称
+  node.addEventListener('mouseenter', () => {
+    if (labelEl.scrollWidth > labelEl.clientWidth + 1) showHoverTip(labelEl, opts.label);
+  });
+  node.addEventListener('mouseleave', hideHoverTip);
   if (opts.count) node.appendChild(mk('span', { class: 'tree-count' }, String(opts.count)));
 
   // 末级分组不能再挂子分组，不显示 ＋
@@ -1356,32 +1361,16 @@ function buildMaterialsPanel(cat) {
   const info = mk('span', { class: 'hint materials-count' });
   bar.appendChild(info);
   bar.appendChild(mk('span', { class: 'spacer' }));
-  if (state.checked.size) {
-    bar.appendChild(mk('span', { class: 'hint' }, `已选 ${state.checked.size} 项`));
-  }
+  const selHint = mk('span', { class: 'hint', id: 'materialsSelectedHint' });
+  selHint.textContent = state.checked.size ? `已选 ${state.checked.size} 项` : '';
+  bar.appendChild(selHint);
   panel.appendChild(bar);
-
-  // 视图切换：工具栏底部右侧，列表 / 表格
-  const viewBar = mk('div', { class: 'view-bar' });
-  const viewSwitch = mk('div', { class: 'view-switch' });
-  for (const [id, label] of [['list', '列表'], ['sheet', '表格']]) {
-    const btn = mk('button', { class: 'view-btn' + (state.materialView === id ? ' active' : '') }, label);
-    btn.addEventListener('click', () => {
-      if (state.materialView === id) return;
-      state.materialView = id;
-      localStorage.setItem('craft.materials.view', id);
-      render();
-    });
-    viewSwitch.appendChild(btn);
-  }
-  viewBar.appendChild(viewSwitch);
-  panel.appendChild(viewBar);
 
   const body = mk('div', { class: 'materials-body' });
   const main = mk('div', { class: 'materials-main' });
   const tableWrap = mk('div', { class: 'table-wrap', id: 'materialsTableWrap' });
   main.appendChild(tableWrap);
-  // 翻页控件固定在内容区右下角，不再占用顶部工具栏
+  // 底部：翻页固定在右下角
   const footer = mk('div', { class: 'materials-footer' });
   footer.appendChild(mk('div', { class: 'materials-pagination', id: 'materialsPagination' }));
   main.appendChild(footer);
@@ -1406,7 +1395,7 @@ function buildSideRail() {
   const exp = mk('button', { class: 'rail-btn', title: '导出当前筛选为 Excel' }, '⤒');
   exp.addEventListener('click', () => doExport());
 
-  const move = mk('button', { class: 'rail-btn', title: '批量转移分组（先勾选）' }, '⇄');
+  const move = mk('button', { class: 'rail-btn', id: 'moveMaterialsBtn', title: '批量转移分组（先勾选）' }, '⇄');
   move.disabled = !state.checked.size;
   move.addEventListener('click', () => openBatchMoveDialog());
 
@@ -1414,7 +1403,7 @@ function buildSideRail() {
   copy.disabled = !state.checked.size || state.copyingMaterials;
   copy.addEventListener('click', () => doCopyMaterial());
 
-  const del = mk('button', { class: 'rail-btn danger-hover', title: '批量删除（先勾选）' }, '✕');
+  const del = mk('button', { class: 'rail-btn danger-hover', id: 'deleteMaterialsBtn', title: '批量删除（先勾选）' }, '✕');
   del.disabled = !state.checked.size;
   del.addEventListener('click', () => doBatchDelete());
 
@@ -1426,7 +1415,34 @@ function buildSideRail() {
   rail.appendChild(copy);
   rail.appendChild(move);
   rail.appendChild(del);
+
+  // 工具栏底部：视图切换（列表显示表格图标，表格显示列表图标）
+  const sheetMode = state.materialView === 'sheet';
+  const viewToggle = mk('button', {
+    class: 'rail-btn',
+    style: 'margin-top: auto;',
+    title: sheetMode ? '切换到列表视图' : '切换到表格视图',
+  }, sheetMode ? '☰' : '▦');
+  viewToggle.addEventListener('click', () => {
+    state.materialView = sheetMode ? 'list' : 'sheet';
+    localStorage.setItem('craft.materials.view', state.materialView);
+    render();
+  });
+  rail.appendChild(viewToggle);
   return rail;
+}
+
+// 表格视图勾选后局部刷新工具栏状态，避免整页重绘把已加载的数据丢掉
+function syncSelectionUi() {
+  const n = state.checked.size;
+  const hint = document.getElementById('materialsSelectedHint');
+  if (hint) hint.textContent = n ? `已选 ${n} 项` : '';
+  const copy = document.getElementById('copyMaterialsBtn');
+  const move = document.getElementById('moveMaterialsBtn');
+  const del = document.getElementById('deleteMaterialsBtn');
+  if (copy) copy.disabled = !n || state.copyingMaterials;
+  if (move) move.disabled = !n;
+  if (del) del.disabled = !n;
 }
 
 function refreshMaterialsTable(panel, cat) {
@@ -1457,16 +1473,9 @@ async function renderMaterialsTable(panel, cat) {
   }
 
   let summaries;
-  let list;
-  let totalPages;
   try {
     summaries = await currentMaterialSummaries();
     if (seq !== state.materialViewSeq) return;
-    totalPages = Math.max(1, Math.ceil(summaries.length / state.materialPageSize));
-    state.materialPage = Math.min(Math.max(1, state.materialPage), totalPages);
-    const start = (state.materialPage - 1) * state.materialPageSize;
-    // 列表只用索引摘要渲染；完整档案在编辑、导出、批量操作时再按分片加载
-    list = summaries.slice(start, start + state.materialPageSize);
   } catch (e) {
     if (seq === state.materialViewSeq) {
       wrap.innerHTML = '';
@@ -1477,7 +1486,23 @@ async function renderMaterialsTable(panel, cat) {
   if (seq !== state.materialViewSeq || !panel.isConnected) return;
 
   wrap.innerHTML = '';
-  if (info) info.textContent = `共 ${summaries.length} 条，每页 ${state.materialPageSize} 条`;
+  const isSheet = state.materialView === 'sheet';
+  const footer = pagination ? pagination.closest('.materials-footer') : null;
+  if (footer) footer.style.display = isSheet ? 'none' : '';
+  if (info) info.textContent = isSheet ? `共 ${summaries.length} 条` : `共 ${summaries.length} 条，每页 ${state.materialPageSize} 条`;
+
+  // 表格视图：不分页，竖直滚动按窗口渲染，数据分批加载
+  if (isSheet) {
+    if (pagination) pagination.innerHTML = '';
+    await renderSheetView(wrap, summaries, cat);
+    return;
+  }
+
+  const totalPages = Math.max(1, Math.ceil(summaries.length / state.materialPageSize));
+  state.materialPage = Math.min(Math.max(1, state.materialPage), totalPages);
+  const start = (state.materialPage - 1) * state.materialPageSize;
+  // 列表只用索引摘要渲染；完整档案在编辑、导出、批量操作时再按分片加载
+  const list = summaries.slice(start, start + state.materialPageSize);
   if (pagination) {
     const prev = mk('button', { class: 'btn small' }, '上一页');
     prev.disabled = state.materialPage <= 1;
@@ -1494,13 +1519,6 @@ async function renderMaterialsTable(panel, cat) {
     pagination.appendChild(prev);
     pagination.appendChild(mk('span', { class: 'page-info' }, `第 ${state.materialPage} / ${totalPages} 页`));
     pagination.appendChild(next);
-  }
-
-  // 表格视图：同一批数据，改为可编辑的电子表格
-  if (state.materialView === 'sheet') {
-    await renderSheetView(wrap, list, cat);
-    if (seq !== state.materialViewSeq) return;
-    return;
   }
 
   const table = mk('table', { class: 'grid' });
@@ -1611,56 +1629,144 @@ const SHEET_TYPES = {
 // 属性列在表格里的 key 加前缀，避免和编码/名称等固定列冲突
 const ATTR_PREFIX = 'attr_';
 
-async function renderSheetView(wrap, list, cat) {
+async function renderSheetView(wrap, summaries, cat) {
   wrap.classList.add('sheet-wrap');
   wrap.innerHTML = '';
-  wrap.appendChild(mk('div', { class: 'empty', style: 'padding:24px;' }, '加载中…'));
-
-  const records = await hydrateMaterials(list);
-  const byId = new Map(records.map(m => [m.id, m]));
+  const seq = state.materialViewSeq;
   const defs = cat && cat.isLeaf ? fieldsOf(attrsOf(cat)) : [];
 
+  const byId = new Map();       // 展示值（已叠加草稿）
+  const baseById = new Map();   // 远端基准值：用来判断哪些格子真的改过
+  const sameVal = (a, b) => JSON.stringify(a ?? '') === JSON.stringify(b ?? '');
+  // 只在「内容确实和远端不同」时标记；改回原值标记随之消失
+  function cellDirty(id, key) {
+    const mat = byId.get(id), base = baseById.get(id);
+    if (!mat || !base) return false;
+    if (key === 'name') return String(mat.name || '') !== String(base.name || '');
+    if (key.startsWith(ATTR_PREFIX)) {
+      const k = key.slice(ATTR_PREFIX.length);
+      return !sameVal(mat.attrs?.[k], base.attrs?.[k]);
+    }
+    return false;
+  }
+  function rowDirty(id) {
+    if (cellDirty(id, 'name')) return true;
+    return defs.some(def => cellDirty(id, ATTR_PREFIX + def.key));
+  }
+
+  let api = null;
   const columns = [
-    { key: 'code', label: '物料编码', readonly: true, freeze: true, width: 150 },
-    { key: 'name', label: '物料名称', width: 220 },
-    ...defs.map(def => ({
-      key: ATTR_PREFIX + def.key,
-      label: def.label || def.key,
-      type: SHEET_TYPES[def.type] || 'text',
-      width: def.type === 'textarea' ? 220 : 140,
-      required: !!def.required,
-      options: (def.options || []).map(v => ({ value: v, label: def.optionsLabels?.[v] || v })),
-    })),
-    { key: '__status', label: '保存状态', readonly: true, width: 100 },
-    { key: '__time', label: '最近编辑时间', readonly: true, width: 150 },
-    { key: '__by', label: '编辑人', readonly: true, width: 110 },
+    {
+      key: '__chk', label: '', width: 36, readonly: true, freeze: true, align: 'center',
+      render: (row) => `<input type="checkbox" class="sheet-chk" data-rid="${row._id}"${state.checked.has(row._id) ? ' checked' : ''}>`,
+      headRender: () => {
+        const rows = api ? api.getRows() : [];
+        const all = rows.length > 0 && rows.every(r => state.checked.has(r._id));
+        return `<input type="checkbox" class="sheet-chk-all"${all ? ' checked' : ''} title="全选已加载">`;
+      },
+    },
+    { key: 'code', label: '物料编码', readonly: true, freeze: true, width: 120 },
+    { key: 'name', label: '物料名称', freeze: true, width: 220, cellClass: (row) => cellDirty(row._id, 'name') ? 'sc-cell-dirty' : '' },
+    ...defs.map(def => {
+      const key = ATTR_PREFIX + def.key;
+      return {
+        key,
+        label: def.label || def.key,
+        type: SHEET_TYPES[def.type] || 'text',
+        width: def.type === 'textarea' ? 220 : 140,
+        required: !!def.required,
+        options: (def.options || []).map(v => ({ value: v, label: def.optionsLabels?.[v] || v })),
+        cellClass: (row) => cellDirty(row._id, key) ? 'sc-cell-dirty' : '',
+      };
+    }),
   ];
 
-  const draftIds = () => new Set(state.drafts.filter(d => d.kind === 'material').map(d => d.recordId));
-  let pending = draftIds();
-  const rows = records.map(mat => {
-    const values = { code: mat.code || '待提交', name: mat.name || '' };
-    for (const def of defs) values[ATTR_PREFIX + def.key] = mat.attrs?.[def.key] ?? '';
-    values.__status = pending.has(mat.id) ? '未保存' : '已保存';
-    values.__time = fmtTime(mat.updatedAt);
-    values.__by = mat.updatedBy || '';
-    return { _id: mat.id, values };
-  });
-
-  wrap.innerHTML = '';
   const host = mk('div', { class: 'sheet-host' });
   wrap.appendChild(host);
-  state.sheetApi = createSheet(host, {
+  api = createSheet(host, {
     columns,
-    rows,
+    rows: [],
     features: { toolbar: false, search: false, log: false, export: false },
-    onChange: (patches) => saveSheetEdits(patches, byId, draftIds),
+    onChange: (patches) => saveSheetEdits(patches, byId, baseById, rowDirty),
   });
-  state.sheetApi.paint();
+  state.sheetApi = api;
+
+  const info = wrap.closest('.tab-panel')?.querySelector('.materials-count');
+  const toRow = (mat) => {
+    const values = { code: mat.code || '待提交', name: mat.name || '' };
+    for (const def of defs) values[ATTR_PREFIX + def.key] = mat.attrs?.[def.key] ?? '';
+    return { _id: mat.id, values, dirty: rowDirty(mat.id) };
+  };
+
+  // 分批加载：先是首屏一批，滚动接近底部再取下一批
+  const BATCH = 200;
+  let loaded = 0;
+  let loading = false;
+  async function loadMore() {
+    if (loading || loaded >= summaries.length) return;
+    loading = true;
+    const batch = summaries.slice(loaded, loaded + BATCH);
+    let failed = false;
+    try {
+      const records = await hydrateMaterials(batch);
+      if (seq !== state.materialViewSeq || !host.isConnected) return;
+      // 有草稿的物料额外取远端基准，用于「改回原值取消标记」；失败就退回加载时快照
+      const drafted = batch.filter(entry => {
+        const d = draftOf('material', entry.id);
+        return d && d.op !== 'delete';
+      });
+      let remoteBase = [];
+      if (drafted.length) {
+        try { remoteBase = await MaterialStore.hydrate(drafted); } catch (_) { remoteBase = []; }
+      }
+      if (seq !== state.materialViewSeq || !host.isConnected) return;
+      for (const mat of records) byId.set(mat.id, mat);
+      for (const base of remoteBase) baseById.set(base.id, base);
+      for (const mat of records) if (!baseById.has(mat.id)) baseById.set(mat.id, clone(mat));
+      api.appendRows(records.map(toRow));
+      loaded += batch.length;
+      if (info) info.textContent = `共 ${summaries.length} 条${loaded < summaries.length ? `（已加载 ${loaded}）` : ''}`;
+    } catch (e) {
+      failed = true;
+      if (seq === state.materialViewSeq) toastErr('物料加载失败：' + (e.message || e));
+    } finally {
+      loading = false;
+    }
+    if (failed) { loaded = summaries.length; return; }
+    // 内容不足一屏时继续补下一批
+    const scroller = host.querySelector('.sc-scroll');
+    if (scroller && loaded < summaries.length && scroller.scrollHeight <= scroller.clientHeight + 120) {
+      setTimeout(() => { if (seq === state.materialViewSeq) loadMore(); }, 0);
+    }
+  }
+
+  const scroller = host.querySelector('.sc-scroll');
+  scroller?.addEventListener('scroll', () => {
+    if (loading || loaded >= summaries.length) return;
+    if (scroller.scrollTop + scroller.clientHeight > scroller.scrollHeight - 600) loadMore();
+  });
+
+  // 勾选列：与列表视图共用 state.checked，只局部刷新工具栏
+  host.addEventListener('change', (e) => {
+    const t = e.target;
+    if (t.classList?.contains('sheet-chk')) {
+      if (t.checked) state.checked.add(t.dataset.rid); else state.checked.delete(t.dataset.rid);
+      api.paint();
+      syncSelectionUi();
+    } else if (t.classList?.contains('sheet-chk-all')) {
+      const rows = api.getRows();
+      if (t.checked) rows.forEach(r => state.checked.add(r._id));
+      else rows.forEach(r => state.checked.delete(r._id));
+      api.paint();
+      syncSelectionUi();
+    }
+  });
+
+  await loadMore();
 }
 
-// 单元格编辑 → 物料草稿；保存状态列同步刷新
-async function saveSheetEdits(patches, byId, draftIds) {
+// 单元格编辑 → 物料草稿（内容改回远端原值时自动撤掉草稿）
+async function saveSheetEdits(patches, byId, baseById, rowDirty) {
   const touched = new Set();
   for (const p of patches) {
     const mat = byId.get(p.rowId);
@@ -1681,19 +1787,31 @@ async function saveSheetEdits(patches, byId, draftIds) {
   }
   for (const mat of touched) {
     const existing = draftOf('material', mat.id);
-    await saveMaterialDraft(mat, existing ? existing.op : 'update');
+    const base = baseById.get(mat.id);
+    // 新增的物料没有远端版本，草稿必须保留；其余改回原值就删草稿
+    if (existing && existing.op !== 'add' && base && !materialChanged(mat, base)) {
+      await Store.removeDraft('material', mat.id);
+      await loadDrafts();
+    } else {
+      await saveMaterialDraft(mat, existing ? existing.op : 'update');
+    }
   }
   const api = state.sheetApi;
   if (!api) return;
-  const pending = draftIds();
-  for (const row of api.getRows()) {
-    const mat = byId.get(row._id);
-    if (!mat) continue;
-    row.values.__status = pending.has(mat.id) ? '未保存' : '已保存';
-    row.values.__time = fmtTime(mat.updatedAt);
-    row.values.__by = mat.updatedBy || '';
-  }
+  for (const row of api.getRows()) row.dirty = rowDirty(row._id);
   api.paint();
+}
+
+// 与远端基准比对（忽略 updatedAt/updatedBy 这类每次编辑都会变的字段）
+function materialChanged(a, b) {
+  if (String(a.name || '') !== String(b.name || '')) return true;
+  if (String(a.categoryId || '') !== String(b.categoryId || '')) return true;
+  if (String(a.code || '') !== String(b.code || '')) return true;
+  return attrSignature(a.attrs) !== attrSignature(b.attrs);
+}
+function attrSignature(attrs) {
+  const src = attrs || {};
+  return JSON.stringify(Object.keys(src).sort().map(k => [k, src[k] ?? '']));
 }
 
 // 保存状态：已保存=与仓库一致，未保存=还有未提交的本地改动
@@ -2082,7 +2200,11 @@ async function doExport() {
     if (!list.length) { toastErr('当前没有可导出的物料'); return; }
     // 物料位置按同步状态推导：有未提交草稿=本地
     const rows = list.map(m => ({ ...m, location: draftOf('material', m.id) ? 'local' : 'cloud' }));
-    const n = Excel.exportMaterials(rows, state.categories, state.attrSets, state.dictionaries);
+    // 文件名用当前分组名：父级分组导出时代表整个子树
+    const groupName = state.selectedCategoryId
+      ? Cat.findCategory(state.categories, state.selectedCategoryId)?.name
+      : '未分组';
+    const n = Excel.exportMaterials(rows, state.categories, state.attrSets, state.dictionaries, groupName);
     toastOk(`已导出 ${n} 条物料`);
   } catch (e) {
     toastErr('导出失败：' + (e.message || e));

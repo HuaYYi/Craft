@@ -16,7 +16,7 @@
   --sc-font: 13px;
 }
 
-.sc-root { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 0 14px; box-sizing: border-box; }
+.sc-root { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; padding: 0 14px; box-sizing: border-box; }
 
 .sc-toolbar { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--sc-border); }
 .sc-toolbar input.sc-search {
@@ -48,9 +48,12 @@
 .sc-table td.sc-readonly { color: var(--sc-muted); cursor: default; }
 .sc-table td.sc-align-right { text-align: right; }
 .sc-table td.sc-align-center { text-align: center; }
+/* 虚拟滚动的上下占位行：只撑高度，不参与样式 */
+.sc-table tr.sc-spacer td { height: auto; padding: 0; border: 0; background: #fff; pointer-events: none; }
 
-/* 冻结列 */
+/* 冻结列：表头与数据行都要 sticky，否则 td 的 left 偏移会把相对定位的单元格推歪 */
 .sc-frozen { position: sticky; z-index: 2; }
+.sc-table td.sc-frozen { position: sticky; background: #fff; }
 .sc-table thead th.sc-frozen { z-index: 4; }
 /* 冻结边界阴影 */
 .sc-frozen-last::after {
@@ -58,6 +61,12 @@
   pointer-events: none;
   background: linear-gradient(to right, rgba(0,0,0,.06), rgba(0,0,0,0));
 }
+
+/* 改过的格子：与远端原值不一致时浅黄，改回原值后自动消失 */
+.sc-table td.sc-cell-dirty { background: #fff3c4; }
+.sc-table tr.sc-dirty td.sc-cell-dirty { background: #fff3c4; }
+.sc-table td.sc-cell-dirty.sc-sel,
+.sc-table tr.sc-dirty td.sc-cell-dirty.sc-sel { background: var(--sc-primary-soft); }
 
 /* 选区 / 编辑 */
 .sc-table td.sc-sel { outline: 2px solid var(--sc-primary); outline-offset: -2px; background: var(--sc-primary-soft); }
@@ -89,6 +98,18 @@
   cursor: col-resize; z-index: 6;
 }
 .sc-sort-ind { margin-left: 4px; font-size: 10px; color: var(--sc-primary); }
+
+/* 悬停详情：内容被截断时显示的全文浮窗 */
+.sc-tip {
+  position: fixed; z-index: 1200; max-width: 320px;
+  padding: 8px 10px; box-sizing: border-box;
+  background: #fff; color: var(--sc-text);
+  border: 1px solid var(--sc-border-strong); border-radius: var(--sc-radius);
+  box-shadow: 0 8px 24px rgba(31, 35, 40, .14);
+  font-size: 12px; line-height: 1.6; font-family: inherit;
+  white-space: pre-wrap; word-break: break-word;
+  pointer-events: none;
+}
 
 /* 空态 / 日志 */
 .sc-empty { padding: 40px; text-align: center; color: var(--sc-muted); font-size: var(--sc-font); }

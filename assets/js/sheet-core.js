@@ -8,6 +8,49 @@
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const numOrRaw = x => { const n = Number(x); return x !== '' && !Number.isNaN(n) ? n : x; };
 
+// ---------- 悬浮详情（内容被截断时，悬停一会儿显示全文） ----------
+let tipEl = null;
+let tipTimer = 0;
+
+export function hideHoverTip() {
+  clearTimeout(tipTimer);
+  if (tipEl) { tipEl.remove(); tipEl = null; }
+}
+
+export function showHoverTip(target, text, delay = 900) {
+  clearTimeout(tipTimer);
+  if (!target?.isConnected || !text) { hideHoverTip(); return; }
+  tipTimer = setTimeout(() => {
+    if (!target.isConnected) return;
+    if (!tipEl) {
+      tipEl = document.createElement('div');
+      tipEl.className = 'sc-tip';
+      document.body.appendChild(tipEl);
+    }
+    tipEl.textContent = text;
+    tipEl.style.visibility = 'hidden';
+    tipEl.style.left = '-9999px';
+    tipEl.style.top = '0px';
+    const r = target.getBoundingClientRect();
+    const tw = tipEl.offsetWidth;
+    const th = tipEl.offsetHeight;
+    let left = Math.min(r.left, window.innerWidth - tw - 8);
+    let top = r.bottom + 6;
+    if (top + th > window.innerHeight - 8) top = r.top - th - 6;
+    tipEl.style.left = `${Math.max(8, left)}px`;
+    tipEl.style.top = `${Math.max(8, top)}px`;
+    tipEl.style.visibility = 'visible';
+  }, delay);
+}
+
+// 滚动、改窗口、按下鼠标都立即关掉，避免浮窗挡住操作
+if (typeof window !== 'undefined') {
+  window.addEventListener('scroll', hideHoverTip, true);
+  window.addEventListener('resize', hideHoverTip);
+  window.addEventListener('mousedown', hideHoverTip, true);
+}
+
+
 function labelOf(col, v) {
   const hit = (col.options || []).find(o => String(o.value) === String(v));
   return hit ? hit.label : String(v);
@@ -66,6 +109,7 @@ export function createSheet(host, options = {}) {
   const feat = Object.assign({
     search: true, fill: true, paste: true, undo: true, resize: true,
     sort: true, export: true, log: true, freeze: true, toolbar: true,
+    virtual: true,          // 行虚拟化：只渲染当前窗口
   }, options.features || {});
 
   const cfg = {
@@ -110,9 +154,34 @@ export function createSheet(host, options = {}) {
   const logEl = host.querySelector('.sc-log');
   const searchEl = host.querySelector('.sc-search');
 
+  // 单元格内容被省略号截断时，悬停约 1 秒浮出全文
+  scrollEl.addEventListener('mouseover', (e) => {
+    const td = e.target instanceof Element ? e.target.closest('td') : null;
+    if (!td || !table || !table.contains(td) || st.editing) return;
+    if (e.relatedTarget instanceof Element && td.contains(e.relatedTarget)) return;
+    const text = (td.textContent || '').trim();
+    if (!text || td.scrollWidth <= td.clientWidth + 1) { hideHoverTip(); return; }
+    showHoverTip(td, text);
+  });
+  scrollEl.addEventListener('mouseout', (e) => {
+    const td = e.target instanceof Element ? e.target.closest('td') : null;
+    if (!td) return;
+    if (e.relatedTarget instanceof Element && td.contains(e.relatedTarget)) return;
+    hideHoverTip();
+  });
+
   let table = null;
   let ghost = null;
   let ghostTimer = null;
+
+  // 行虚拟化：固定行高，窗口上下各留 PAD 行缓冲
+  const ROW_H = 30;
+  const V_PAD = 8;
+  let viewCache = null;
+  let scrollRaf = 0;
+
+  function invalidateView() { viewCache = null; }
+  function getView() { if (!viewCache) viewCache = viewRows(); return viewCache; }
 
   // ---------- 数据 ----------
   function normalize(rows) {
@@ -139,7 +208,18 @@ export function createSheet(host, options = {}) {
     st.rows = normalize(rows);
     st.sel = null; st.rangeEnd = null;
     st.undoStack = []; st.redoStack = [];
+    invalidateView();
     paint();
+  }
+
+  /** 追加若干行（无限滚动/分批加载用），不重置选区与撤销栈 */
+  function appendRows(rows) {
+    const list = normalize(rows);
+    if (!list.length) return 0;
+    st.rows.push(...list);
+    invalidateView();
+    if (!st.editing) paint();
+    return list.length;
   }
 
   function getRows() { return st.rows; }
@@ -163,6 +243,7 @@ export function createSheet(host, options = {}) {
     st.rows = st.rows.filter(r => !set.has(String(r._id)));
     st.sel = null; st.rangeEnd = null;
     st.undoStack = []; st.redoStack = [];
+    invalidateView();
     paint();
     const n = before - st.rows.length;
     if (n) log(`删除 ${n} 行`);
@@ -224,9 +305,81 @@ export function createSheet(host, options = {}) {
   }
 
   // ---------- 渲染 ----------
+  function renderHead(fi, lefts, last) {
+    return st.cols.map((c, i) => {
+      const frozen = fi.includes(i);
+      const cls = [frozen ? 'sc-frozen' : '', frozen && i === last ? 'sc-frozen-last' : ''].filter(Boolean).join(' ');
+      const sortMark = st.sort && st.sort.ci === i ? `<span class="sc-sort-ind">${st.sort.dir > 0 ? '▲' : '▼'}</span>` : '';
+      const headInner = c.headRender
+        ? c.headRender()
+        : `<span class="sc-th-label">${esc(c.label)}</span>${sortMark}`;
+      return `<th data-ci="${i}" class="${cls}" style="width:${c.width}px${frozen ? ';left:' + lefts[i] + 'px' : ''}">
+        ${headInner}
+        ${feat.resize ? '<span class="sc-resizer" data-ci="' + i + '"></span>' : ''}
+      </th>`;
+    }).join('');
+  }
+
+  function renderRow(row, ri, fi, lefts, last) {
+    const cells = st.cols.map((c, i) => {
+      const frozen = fi.includes(i);
+      const cls = [
+        frozen ? 'sc-frozen' : '',
+        frozen && i === last ? 'sc-frozen-last' : '',
+        c.readonly ? 'sc-readonly' : '',
+        c.align === 'right' ? 'sc-align-right' : c.align === 'center' ? 'sc-align-center' : '',
+        c.cellClass ? c.cellClass(row) : '',
+      ].filter(Boolean).join(' ');
+      const txt = c.render ? c.render(row) : esc(cellText(row, c));
+      return `<td data-ci="${i}" data-ri="${ri}" data-rid="${esc(row._id)}" class="${cls}"
+        style="width:${c.width}px${frozen ? ';left:' + lefts[i] + 'px' : ''}">${txt}<div class="sc-fill-handle"></div></td>`;
+    }).join('');
+    const trCls = [row.dirty ? 'sc-dirty' : '', row.error ? 'sc-error' : ''].filter(Boolean).join(' ');
+    return `<tr data-rid="${esc(row._id)}" class="${trCls}">${cells}</tr>`;
+  }
+
+  function spacerRow(h, colCount) {
+    return h > 0
+      ? `<tr class="sc-spacer"><td colspan="${colCount}" style="height:${h}px"></td></tr>`
+      : '';
+  }
+
+  // 按滚动位置渲染窗口内的行：上下用占位行撑出真实滚动高度
+  function paintBody(view, topOverride) {
+    if (!table) return;
+    const rows = view || getView();
+    const tbody = table.tBodies[0];
+    if (!rows.length) { tbody.innerHTML = ''; st.win = null; return; }
+    const total = rows.length;
+    const scrollTop = topOverride == null ? scrollEl.scrollTop : topOverride;
+    let start = 0;
+    let end = total;
+    if (feat.virtual && total > 60) {
+      const headH = table.tHead ? table.tHead.offsetHeight : 32;
+      const top = Math.max(0, scrollTop - headH);
+      const visible = Math.ceil((scrollEl.clientHeight || 400) / ROW_H) + 1;
+      start = Math.max(0, Math.floor(top / ROW_H) - V_PAD);
+      end = Math.min(total, start + visible + V_PAD * 2);
+      if (end - start < visible + V_PAD * 2) start = Math.max(0, end - (visible + V_PAD * 2));
+    }
+    if (st.win && st.win.start === start && st.win.end === end) return;
+    st.win = { start, end };
+
+    const { idx: fi, lefts, last } = frozenInfo();
+    const html = [];
+    html.push(spacerRow(start * ROW_H, st.cols.length));
+    for (let ri = start; ri < end; ri++) html.push(renderRow(rows[ri], ri, fi, lefts, last));
+    html.push(spacerRow((total - end) * ROW_H, st.cols.length));
+    tbody.innerHTML = html.join('');
+    ensureGhost();
+    markSel();
+  }
+
   function paint() {
     if (st.editing) st.editing = null;
-    const view = viewRows();
+    invalidateView();
+    st.win = null;
+    const view = getView();
     if (countEl) countEl.textContent = `${view.length} 条`;
 
     if (!view.length) {
@@ -236,39 +389,22 @@ export function createSheet(host, options = {}) {
     }
     const { idx: fi, lefts, last } = frozenInfo();
     const totalW = st.cols.reduce((a, c) => a + c.width, 0);
-    const head = st.cols.map((c, i) => {
-      const frozen = fi.includes(i);
-      const cls = [frozen ? 'sc-frozen' : '', frozen && i === last ? 'sc-frozen-last' : ''].filter(Boolean).join(' ');
-      const sortMark = st.sort && st.sort.ci === i ? `<span class="sc-sort-ind">${st.sort.dir > 0 ? '▲' : '▼'}</span>` : '';
-      return `<th data-ci="${i}" class="${cls}" style="width:${c.width}px${frozen ? ';left:' + lefts[i] + 'px' : ''}">
-        <span class="sc-th-label">${esc(c.label)}</span>${sortMark}
-        ${feat.resize ? '<span class="sc-resizer" data-ci="' + i + '"></span>' : ''}
-      </th>`;
-    }).join('');
-
-    const body = view.map((row, ri) => {
-      const cells = st.cols.map((c, i) => {
-        const frozen = fi.includes(i);
-        const cls = [
-          frozen ? 'sc-frozen' : '',
-          frozen && i === last ? 'sc-frozen-last' : '',
-          c.readonly ? 'sc-readonly' : '',
-          c.align === 'right' ? 'sc-align-right' : c.align === 'center' ? 'sc-align-center' : '',
-        ].filter(Boolean).join(' ');
-        const txt = esc(cellText(row, c));
-        return `<td data-ci="${i}" data-ri="${ri}" data-rid="${esc(row._id)}" class="${cls}"
-          style="width:${c.width}px${frozen ? ';left:' + lefts[i] + 'px' : ''}">${txt}<div class="sc-fill-handle"></div></td>`;
-      }).join('');
-      const trCls = [row.dirty ? 'sc-dirty' : '', row.error ? 'sc-error' : ''].filter(Boolean).join(' ');
-      return `<tr data-rid="${esc(row._id)}" class="${trCls}">${cells}</tr>`;
-    }).join('');
-
+    const scTop = scrollEl.scrollTop;
     scrollEl.innerHTML = `<table class="sc-table" style="width:${totalW}px;min-width:100%">
-      <thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+      <thead><tr>${renderHead(fi, lefts, last)}</tr></thead><tbody></tbody></table>`;
     table = scrollEl.querySelector('.sc-table');
-    ensureGhost();
-    markSel();
+    paintBody(view, scTop);
+    scrollEl.scrollTop = scTop;
   }
+
+  // 滚动时只重绘窗口内的行；编辑中先不重绘，提交后再刷新
+  scrollEl.addEventListener('scroll', () => {
+    if (!feat.virtual || !table || st.editing || scrollRaf) return;
+    scrollRaf = requestAnimationFrame(() => {
+      scrollRaf = 0;
+      if (table && !st.editing) paintBody();
+    });
+  });
 
   function ensureGhost() {
     if (!feat.fill) return;
@@ -294,7 +430,7 @@ export function createSheet(host, options = {}) {
   }
 
   function normalizeSel(r, c) {
-    const view = viewRows();
+    const view = getView();
     r = Math.max(0, Math.min(view.length - 1, r));
     c = Math.max(0, Math.min(st.cols.length - 1, c));
     return { r, c };
@@ -310,18 +446,30 @@ export function createSheet(host, options = {}) {
       st.rangeEnd = null;
     }
     markSel();
-    const active = st.rangeEnd || st.sel;
-    const td = tdAt(active.r, active.c);
-    if (td) td.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    ensureVisible((st.rangeEnd || st.sel).r);
+  }
+
+  // 滚动到目标行（虚拟化下目标行可能不在窗口内）
+  function ensureVisible(r) {
+    if (!table) return;
+    const headH = table.tHead ? table.tHead.offsetHeight : 32;
+    const y = r * ROW_H;
+    const top = scrollEl.scrollTop - headH;
+    const viewH = scrollEl.clientHeight || 400;
+    if (y < top || y + ROW_H > top + viewH - ROW_H) {
+      scrollEl.scrollTop = Math.max(0, headH + y - viewH / 2);
+    }
+    paintBody();
+    markSel();
   }
 
   const tdAt = (r, c) => table ? table.querySelector(`td[data-ri="${r}"][data-ci="${c}"]`) : null;
-  function rowAt(r) { return viewRows()[r] || null; }
+  function rowAt(r) { return getView()[r] || null; }
   function colAt(c) { return st.cols[c] || null; }
 
   function getSelectionInfo() {
     if (!st.sel) return null;
-    const view = viewRows();
+    const view = getView();
     const a = st.sel, b = st.rangeEnd || st.sel;
     const rows = [];
     for (let r = Math.min(a.r, b.r); r <= Math.max(a.r, b.r); r++) if (view[r]) rows.push(view[r]);
@@ -383,6 +531,7 @@ export function createSheet(host, options = {}) {
   /** 统一的写入通道：更新内存 + 通知宿主 + 入撤销栈 */
   function applyPatches(patches, kind = 'edit') {
     if (!patches.length) return;
+    invalidateView();
     const touched = new Set();
     patches.forEach(p => {
       const row = p.row || rowById(p.rowId);
@@ -491,7 +640,7 @@ export function createSheet(host, options = {}) {
   function hideGhost() { if (ghost) ghost.style.display = 'none'; }
 
   function doFill(f) {
-    const view = viewRows();
+    const view = getView();
     const srcRows = [];
     for (let r = f.r1; r <= f.r2; r++) if (view[r]) srcRows.push(view[r]);
     if (!srcRows.length) return;
@@ -562,7 +711,7 @@ export function createSheet(host, options = {}) {
   function pasteText(text) {
     if (!st.sel || !text) return;
     const lines = text.replace(/\r\n?/g, '\n').replace(/\n$/, '').split('\n');
-    const view = viewRows();
+    const view = getView();
     const patches = [];
     const rejected = [];
     lines.forEach((line, dr) => {
@@ -650,11 +799,13 @@ export function createSheet(host, options = {}) {
 
   scrollEl.addEventListener('click', e => {
     const th = e.target.closest('th');
-    if (!th || e.target.closest('.sc-resizer') || !feat.sort) return;
+    if (!th || e.target.closest('.sc-resizer') || e.target.closest('input') || !feat.sort) return;
     const ci = +th.dataset.ci;
     if (!st.sort || st.sort.ci !== ci) st.sort = { ci, dir: 1 };
     else if (st.sort.dir === 1) st.sort = { ci, dir: -1 };
     else st.sort = null;
+    invalidateView();
+    st.sel = null; st.rangeEnd = null;
     paint();
   });
 
@@ -714,12 +865,12 @@ export function createSheet(host, options = {}) {
     });
   }
 
-  function setSearch(kw) { st.search = String(kw || '').trim(); if (searchEl) searchEl.value = st.search; st.sel = null; paint(); }
-  function setFilter(fn) { st.filterFn = fn || null; st.sel = null; paint(); }
+  function setSearch(kw) { st.search = String(kw || '').trim(); if (searchEl) searchEl.value = st.search; st.sel = null; invalidateView(); paint(); }
+  function setFilter(fn) { st.filterFn = fn || null; st.sel = null; invalidateView(); paint(); }
 
   // ---------- 导出 ----------
   function exportRows() {
-    const view = viewRows();
+    const view = getView();
     const head = st.cols.map(c => c.label);
     const body = view.map(row => st.cols.map(c => cellText(row, c)));
     return { head, body };
@@ -760,7 +911,7 @@ export function createSheet(host, options = {}) {
   paint();
 
   return {
-    paint, setRows, getRows, setColumns, rowById,
+    paint, setRows, appendRows, getRows, setColumns, rowById,
     addRow, removeRows, selectedRowIds,
     setSearch, setFilter, selectFirst: () => setSel(0, 0),
     focusCell: (r, c) => setSel(r, c),
@@ -769,7 +920,7 @@ export function createSheet(host, options = {}) {
     getSelection: getSelectionInfo,
     get state() { return st; },
     cols: () => st.cols,
-    rowsView: viewRows,
+    rowsView: getView,
   };
 }
 
