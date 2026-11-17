@@ -13,7 +13,9 @@
   --danger: #d1242f;
   --ok: #1a7f37;
   --radius: 6px;
+  --control-h: 32px;
   --shadow: 0 1px 3px rgba(0,0,0,.06), 0 2px 8px rgba(0,0,0,.04);
+  --shadow-pop: 0 8px 24px rgba(31,35,40,.12);
   --mono: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
 }
 
@@ -35,7 +37,8 @@ code { font-family: var(--mono); font-size: .92em; background: var(--hover); pad
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: 6px 14px;
+  padding: 0 14px;
+  height: var(--control-h);
   border: 1px solid var(--border-strong);
   background: var(--surface);
   color: var(--text);
@@ -147,7 +150,7 @@ code { font-family: var(--mono); font-size: .92em; background: var(--hover); pad
 .feature {
   padding: 22px 20px;
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--radius);
   background: #fff;
 }
 .feature-index { margin-bottom: 18px; font-family: var(--mono); font-size: 11px; color: var(--text-muted); }
@@ -217,7 +220,7 @@ body.login { background: #f6f8fa; }
   width: min(470px, 100%);
   padding: 28px;
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: var(--radius);
   background: #fff;
   box-shadow: var(--shadow);
 }
@@ -229,7 +232,8 @@ body.login { background: #f6f8fa; }
 .field input,
 .repo-toolbar input {
   width: 100%;
-  padding: 8px 10px;
+  height: var(--control-h);
+  padding: 0 10px;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
   background: #fff;
@@ -293,9 +297,9 @@ body.login { background: #f6f8fa; }
   max-height: 280px;
   overflow-y: auto;
   background: #fff;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  box-shadow: var(--shadow);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-pop);
 }
 .repo-item {
   display: block;

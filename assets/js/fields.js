@@ -3,6 +3,7 @@
 // 附件是表级区域（见 renderAttachmentZone），不是单字段类型
 
 import { FIELD_TYPES } from './config.js';
+import { openPicker, openDatePicker } from './pickers.js';
 
 // ---------- 渲染 ----------
 
@@ -61,9 +62,24 @@ function renderField(field, record) {
         min: field.min, max: field.max, step: field.step ?? 1,
       });
       break;
-    case 'date':
-      control = mk('input', { type: 'date', id: `f-${field.key}`, value: val });
+    case 'date': {
+      // 与下拉单选/下拉多选共用同一套按钮和浮层
+      control = mk('div', { class: 'ms-drop', 'data-field': field.key, 'data-value': val ? String(val).slice(0, 10) : '' });
+      const btn = mk('button', { type: 'button', class: 'ms-toggle' });
+      const sync = () => {
+        const v = control.dataset.value;
+        btn.textContent = v || '请选择日期';
+        btn.classList.toggle('is-placeholder', !v);
+      };
+      btn.addEventListener('click', () => openDatePicker({
+        anchor: btn,
+        value: control.dataset.value,
+        onChange: (v) => { control.dataset.value = v; sync(); },
+      }));
+      sync();
+      control.appendChild(btn);
       break;
+    }
     case 'checkbox': {
       control = mk('label', { class: 'checkbox-label' });
       const cb = mk('input', { type: 'checkbox', id: `f-${field.key}`, checked: !!val });
@@ -72,15 +88,21 @@ function renderField(field, record) {
       break;
     }
     case 'select': {
-      control = mk('select', { id: `f-${field.key}` });
-      // 选项里已含空值项（如「未分组」）时不再加占位符
-      if (!field.required && !(field.options || []).includes('')) control.appendChild(mk('option', { value: '' }, '—'));
-      for (const opt of (field.options || [])) {
-        // optionsLabels 用于 value 和显示文案不一致的场景（如分组 id → 分组路径）
-        const o = mk('option', { value: opt }, field.optionsLabels?.[opt] || opt);
-        if (val === opt) o.selected = true;
-        control.appendChild(o);
-      }
+      control = mk('div', { class: 'ms-drop', 'data-field': field.key, 'data-value': val == null ? '' : String(val) });
+      const btn = mk('button', { type: 'button', class: 'ms-toggle' });
+      const opts = (field.options || []).map(o => ({ value: o, label: field.optionsLabels?.[o] || o }));
+      if (!field.required && !(field.options || []).includes('')) opts.unshift({ value: '', label: '—' });
+      const sync = () => {
+        const v = control.dataset.value;
+        btn.textContent = opts.find(o => String(o.value) === String(v))?.label ?? '—';
+        btn.classList.toggle('is-placeholder', v === '');
+      };
+      btn.addEventListener('click', () => openPicker({
+        anchor: btn, options: opts, value: control.dataset.value,
+        onChange: (v) => { control.dataset.value = String(v); sync(); },
+      }));
+      sync();
+      control.appendChild(btn);
       break;
     }
     case 'radio': {
@@ -107,6 +129,31 @@ function renderField(field, record) {
       }
       break;
     }
+    case 'multiselectDropdown': {
+      // 下拉多选：与下拉单选、日期共用同一个按钮和浮层
+      control = mk('div', {
+        class: 'ms-drop', 'data-field': field.key,
+        'data-value': JSON.stringify(Array.isArray(val) ? val : []),
+      });
+      const btn = mk('button', { type: 'button', class: 'ms-toggle' });
+      const opts = (field.options || []).map(o => ({ value: o, label: field.optionsLabels?.[o] || o }));
+      const sync = () => {
+        const arr = JSON.parse(control.dataset.value || '[]');
+        const labels = arr.map(v => opts.find(o => String(o.value) === String(v))?.label ?? v);
+        btn.textContent = labels.length ? labels.join('、') : '请选择';
+        btn.classList.toggle('is-placeholder', !labels.length);
+      };
+      btn.addEventListener('click', () => openPicker({
+        anchor: btn,
+        options: opts,
+        value: JSON.parse(control.dataset.value || '[]'),
+        multiple: true,
+        onChange: (arr) => { control.dataset.value = JSON.stringify(arr); sync(); },
+      }));
+      sync();
+      control.appendChild(btn);
+      break;
+    }
     case 'range': {
       // min-max 对
       const box = mk('div', { class: 'range-box', 'data-field': field.key });
@@ -122,7 +169,7 @@ function renderField(field, record) {
       control = mk('input', { type: 'text', id: `f-${field.key}`, value: String(val) });
   }
 
-  if (field.type !== 'radio' && field.type !== 'multiselect' && field.type !== 'checkbox') {
+  if (field.type !== 'radio' && field.type !== 'multiselect' && field.type !== 'multiselectDropdown' && field.type !== 'checkbox') {
     control.id = `f-${field.key}`;
   }
   wrap.appendChild(control);
@@ -133,18 +180,21 @@ function readField(root, field) {
   switch (field.type) {
     case 'text':
     case 'textarea':
-    case 'number':
-    case 'date': {
+    case 'number': {
       const el = root.querySelector(`#f-${field.key}`);
       return field.type === 'number' && el.value !== '' ? Number(el.value) : el.value;
+    }
+    case 'date': {
+      const box = root.querySelector(`.ms-drop[data-field="${field.key}"]`);
+      return box?.dataset.value || '';
     }
     case 'checkbox': {
       const el = root.querySelector(`#f-${field.key}`);
       return el.checked;
     }
     case 'select': {
-      const el = root.querySelector(`#f-${field.key}`);
-      return el.value;
+      const box = root.querySelector(`.ms-drop[data-field="${field.key}"]`);
+      return box?.dataset.value ?? '';
     }
     case 'radio': {
       const el = root.querySelector(`input[name="f-${field.key}"]:checked`);
@@ -156,6 +206,11 @@ function readField(root, field) {
       return Array.from(group.querySelectorAll('input[type="checkbox"]'))
         .filter(c => c.checked)
         .map(c => c.value);
+    }
+    case 'multiselectDropdown': {
+      const box = root.querySelector(`.ms-drop[data-field="${field.key}"]`);
+      if (!box) return [];
+      try { return JSON.parse(box.dataset.value || '[]'); } catch { return []; }
     }
     case 'range': {
       const box = root.querySelector(`.range-box[data-field="${field.key}"]`);

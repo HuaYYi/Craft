@@ -46,6 +46,7 @@ export const FIELD_TYPES = {
   select:      { label: '下拉单选',   needsOptions: true  },
   radio:       { label: '单选',       needsOptions: true  },
   multiselect: { label: '多选',       needsOptions: true  },
+  multiselectDropdown: { label: '下拉多选', needsOptions: true },
   range:       { label: '区间(min-max)', needsOptions: false },
   date:        { label: '日期',       needsOptions: false },
   checkbox:    { label: '开关',       needsOptions: false },

@@ -8,6 +8,8 @@
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const numOrRaw = x => { const n = Number(x); return x !== '' && !Number.isNaN(n) ? n : x; };
 
+import { openPicker, openDatePicker } from './pickers.js';
+
 // ---------- 悬浮详情（内容被截断时，悬停一会儿显示全文） ----------
 let tipEl = null;
 let tipTimer = 0;
@@ -43,6 +45,20 @@ export function showHoverTip(target, text, delay = 900) {
   }, delay);
 }
 
+// 文本是否真的被省略号截断：按文本实际宽度判断，
+// 不能用 scrollWidth（冻结列阴影、填充柄等伪元素/悬浮元素会把 scrollWidth 撑大）
+export function isTextTruncated(el) {
+  if (!el || !el.isConnected) return false;
+  const style = getComputedStyle(el);
+  if (style.textOverflow !== 'ellipsis') return false;
+  if (!String(el.textContent || '').trim()) return false;
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  const width = range.getBoundingClientRect().width;
+  const inner = el.clientWidth - (parseFloat(style.paddingLeft) || 0) - (parseFloat(style.paddingRight) || 0);
+  return width > inner + 1;
+}
+
 // 滚动、改窗口、按下鼠标都立即关掉，避免浮窗挡住操作
 if (typeof window !== 'undefined') {
   window.addEventListener('scroll', hideHoverTip, true);
@@ -62,8 +78,10 @@ export function fmtCell(col, raw) {
   switch (col.type) {
     case 'bool': return raw === true || raw === 'true' || raw === 1 || raw === '1' ? '是' : '否';
     case 'multiselect': return Array.isArray(raw) ? raw.map(v => labelOf(col, v)).join('、') : String(raw);
+    case 'multiselectDropdown': return Array.isArray(raw) ? raw.map(v => labelOf(col, v)).join('、') : String(raw);
     case 'range': return (raw && typeof raw === 'object') ? `${raw.min ?? ''} ~ ${raw.max ?? ''}` : String(raw);
     case 'select': return labelOf(col, raw);
+    case 'radio': return labelOf(col, raw);
     default: return String(raw);
   }
 }
@@ -85,6 +103,7 @@ export function parseCell(col, text) {
       return { ok: false, reason: '请填「是」或「否」' };
     }
     case 'multiselect':
+    case 'multiselectDropdown':
       return { ok: true, value: s.split(/[/、,，]/).map(x => x.trim()).filter(Boolean) };
     case 'range': {
       const p = s.split(/[~～]/).map(x => x.trim());
@@ -92,6 +111,11 @@ export function parseCell(col, text) {
       return { ok: true, value: { min: numOrRaw(p[0]), max: numOrRaw(p[1]) } };
     }
     case 'select': {
+      const hit = (col.options || []).find(o => String(o.label) === s || String(o.value) === s);
+      if (!hit) return { ok: false, reason: '不在可选范围内' };
+      return { ok: true, value: hit.value };
+    }
+    case 'radio': {
       const hit = (col.options || []).find(o => String(o.label) === s || String(o.value) === s);
       if (!hit) return { ok: false, reason: '不在可选范围内' };
       return { ok: true, value: hit.value };
@@ -121,6 +145,7 @@ export function createSheet(host, options = {}) {
     searchPlaceholder: options.searchPlaceholder || '搜索…',
     onLog: options.onLog || null,
     onSelectionChange: options.onSelectionChange || null,
+    onError: options.onError || null,            // (message) => void 校验提示
     batchHandler: options.batchHandler || null,  // 外部挂的「批量修改」处理器
     formatter: options.formatter || null,        // (row, col) => text 覆盖默认
   };
@@ -160,7 +185,7 @@ export function createSheet(host, options = {}) {
     if (!td || !table || !table.contains(td) || st.editing) return;
     if (e.relatedTarget instanceof Element && td.contains(e.relatedTarget)) return;
     const text = (td.textContent || '').trim();
-    if (!text || td.scrollWidth <= td.clientWidth + 1) { hideHoverTip(); return; }
+    if (!text || !isTextTruncated(td)) { hideHoverTip(); return; }
     showHoverTip(td, text);
   });
   scrollEl.addEventListener('mouseout', (e) => {
@@ -487,6 +512,12 @@ export function createSheet(host, options = {}) {
     const td = tdAt(r, c); if (!td) return false;
     cancelEdit({ silent: true });
     st.editing = { r, c, col, row };
+    if (['select', 'bool', 'radio', 'multiselect', 'multiselectDropdown'].includes(col.type)) {
+      return beginChoiceEdit(col, row, td);
+    }
+    if (col.type === 'date') return beginDatePickEdit(col, row, td);
+    if (col.type === 'range') return beginRangeEdit(col, row, td);
+
     const input = document.createElement('input');
     input.className = 'sc-input';
     input.value = initial != null ? initial : cellText(row, col);
@@ -505,17 +536,117 @@ export function createSheet(host, options = {}) {
     return true;
   }
 
+  // 下拉单选 / 开关 / 单选 / 多选：统一使用浮层选择器
+  function beginChoiceEdit(col, row, td) {
+    const multiple = col.type === 'multiselect' || col.type === 'multiselectDropdown';
+    const options = col.type === 'bool'
+      ? [{ value: true, label: '是' }, { value: false, label: '否' }]
+      : (col.options || []).map(o => ({ value: o.value, label: o.label }));
+    const picker = openPicker({
+      anchor: td,
+      options,
+      value: row.values[col.key] ?? (multiple ? [] : ''),
+      multiple,
+      onChange: (v) => {
+        const prev = row.values[col.key];
+        const next = multiple ? (Array.isArray(v) ? v.slice() : []) : v;
+        if (JSON.stringify(next) === JSON.stringify(prev ?? (multiple ? [] : ''))) return;
+        applyPatches([{ rowId: row._id, key: col.key, prev, next, row }], 'edit');
+      },
+    });
+    st.editing = { ...st.editing, picker };
+    return true;
+  }
+
+  // 日期：统一日历浮层
+  function beginDatePickEdit(col, row, td) {
+    const prev = row.values[col.key];
+    const picker = openDatePicker({
+      anchor: td,
+      value: String(prev ?? '').slice(0, 10),
+      onChange: (v) => {
+        if (String(v) === String(prev ?? '')) return;
+        applyPatches([{ rowId: row._id, key: col.key, prev, next: v, row }], 'edit');
+      },
+    });
+    st.editing = { ...st.editing, picker };
+    return true;
+  }
+
+  // 区间：左右两个输入框，中间固定波浪号；两边都空即空值
+  function beginRangeEdit(col, row, td) {
+    const cur = row.values[col.key];
+    const has = cur && typeof cur === 'object';
+    const wrap = document.createElement('div');
+    wrap.className = 'sc-range-edit';
+    const mkIn = (v) => {
+      const i = document.createElement('input');
+      i.className = 'sc-range-input';
+      i.value = v == null ? '' : String(v);
+      return i;
+    };
+    const a = mkIn(has ? cur.min : '');
+    const b = mkIn(has ? cur.max : '');
+    const sep = document.createElement('span');
+    sep.className = 'sc-range-sep';
+    sep.textContent = '~';
+    wrap.append(a, sep, b);
+    td.textContent = '';
+    td.appendChild(wrap);
+    st.editing = { ...st.editing, range: wrap };
+    a.focus();
+    a.select();
+
+    const side = (s) => {
+      const t = String(s ?? '').trim();
+      if (!t) return '';
+      const n = Number(t);
+      return Number.isNaN(n) ? null : n;
+    };
+    const close = (commit) => {
+      if (!st.editing || st.editing.range !== wrap) return;
+      st.editing = null;
+      window.removeEventListener('scroll', onScroll, true);
+      if (commit) {
+        const p1 = side(a.value);
+        const p2 = side(b.value);
+        if (p1 === null || p2 === null) {
+          paint();
+          if (typeof cfg.onError === 'function') cfg.onError(`${col.label}：请填数字`);
+          return;
+        }
+        const next = (p1 === '' && p2 === '') ? '' : { min: p1, max: p2 };
+        const prev = row.values[col.key];
+        if (JSON.stringify(next) !== JSON.stringify(prev ?? '')) {
+          applyPatches([{ rowId: row._id, key: col.key, prev, next, row }], 'edit');
+        }
+      }
+      paint();
+    };
+    const onScroll = () => close(false);
+    wrap.addEventListener('keydown', ev => {
+      ev.stopPropagation();
+      if (ev.key === 'Enter') { ev.preventDefault(); close(true); }
+      else if (ev.key === 'Escape') { ev.preventDefault(); close(false); }
+    });
+    wrap.addEventListener('focusout', ev => { if (!wrap.contains(ev.relatedTarget)) close(true); });
+    window.addEventListener('scroll', onScroll, true);
+    return true;
+  }
+
   function cancelEdit({ silent = false } = {}) {
     const ed = st.editing; if (!ed) return;
     st.editing = null;
+    if (ed.picker) ed.picker.close();
     if (!silent) paint();
   }
 
   function commitEdit() {
     const ed = st.editing; if (!ed) return;
+    if (ed.picker) return;                  // 浮层选择器自己提交
     st.editing = null;
-    const input = ed.r != null && tdAt(ed.r, ed.c) ? tdAt(ed.r, ed.c).querySelector('input.sc-input') : null;
-    const raw = input ? input.value : '';
+    const editor = ed.r != null && tdAt(ed.r, ed.c) ? tdAt(ed.r, ed.c).querySelector('.sc-input') : null;
+    const raw = editor ? editor.value : '';
     const col = ed.col; const row = ed.row;
 
     const res = parseCell(col, raw);

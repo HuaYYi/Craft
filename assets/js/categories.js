@@ -124,7 +124,7 @@ export function attrValueFromDisplay(def, raw) {
     const t = String(s).trim();
     return rev.has(t) ? rev.get(t) : t;
   };
-  if (def.type === 'multiselect') return String(raw).split(/[/、,，]/).map(toValue).filter(Boolean);
+  if (def.type === 'multiselect' || def.type === 'multiselectDropdown') return String(raw).split(/[/、,，]/).map(toValue).filter(Boolean);
   return toValue(raw);
 }
 
@@ -146,7 +146,8 @@ export function parseAttrValue(def, raw) {
       if (no.includes(s)) return false;
       return undefined;
     }
-    case 'multiselect': {
+    case 'multiselect':
+    case 'multiselectDropdown': {
       const arr = Array.isArray(raw)
         ? raw.map(x => String(x).trim())
         : String(raw).split(/[/、,，]/).map(x => x.trim());

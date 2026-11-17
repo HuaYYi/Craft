@@ -4,13 +4,13 @@
    宿主可用 :root{ --sc-primary: ... } 覆盖
    ============================================================ */
 :root {
-  --sc-primary: #2f6fed;
-  --sc-primary-soft: #eaf1ff;
-  --sc-border: #e6e8eb;
-  --sc-border-strong: #cfd4da;
+  --sc-primary: #0969da;
+  --sc-primary-soft: #ddf4ff;
+  --sc-border: #e2e4e8;
+  --sc-border-strong: #d0d7de;
   --sc-text: #1f2328;
-  --sc-muted: #7a8189;
-  --sc-head-bg: #f6f8fa;
+  --sc-muted: #656d76;
+  --sc-head-bg: #fafbfc;
   --sc-dirty-bg: #fffbe6;
   --sc-radius: 6px;
   --sc-font: 13px;
@@ -76,6 +76,64 @@
   border: none; outline: none; font: inherit; padding: 0 10px; background: #fff;
   color: var(--sc-text);
 }
+/* 区间编辑器 */
+.sc-range-edit {
+  position: absolute; inset: 0; display: flex; align-items: center; gap: 4px;
+  padding: 0 6px; box-sizing: border-box; background: #fff;
+}
+.sc-range-input {
+  flex: 1 1 0; min-width: 0; height: 22px; padding: 0 4px;
+  border: 1px solid var(--sc-border-strong); border-radius: 4px;
+  font: inherit; color: var(--sc-text); outline: none;
+}
+.sc-range-input:focus { border-color: var(--sc-primary); }
+.sc-range-sep { color: var(--sc-muted); font-size: 12px; }
+
+/* 浮层选择器（下拉 / 多选 / 日期）：表单与表格共用同一套外观 */
+.ui-pop {
+  display: none; position: fixed; z-index: 900; box-sizing: border-box;
+  background: #fff; border: 1px solid var(--sc-border-strong, #d0d7de);
+  border-radius: var(--sc-radius, 6px); box-shadow: 0 8px 24px rgba(31, 35, 40, .12);
+  padding: 6px;
+}
+.ui-pop.open { display: block; }
+.ui-pop-list { max-height: 220px; overflow: auto; }
+.ui-pop-item {
+  display: flex; align-items: center; gap: 6px; width: 100%; padding: 6px 8px;
+  border: 0; border-radius: 4px; background: none; box-sizing: border-box;
+  font: inherit; font-size: 13px; color: var(--sc-text, #1f2328);
+  text-align: left; white-space: nowrap; cursor: pointer;
+}
+.ui-pop-item:hover { background: var(--sc-primary-soft); }
+.ui-pop-item.active { background: var(--sc-primary-soft); color: var(--sc-primary); }
+.ui-pop-empty { padding: 8px; font-size: 12px; color: var(--sc-muted, #656d76); }
+
+.ui-pop-cal { padding: 8px; }
+.ui-cal-head { display: flex; align-items: center; justify-content: space-between; padding: 2px 2px 8px; }
+.ui-cal-title { font-size: 13px; font-weight: 600; color: var(--sc-text, #1f2328); }
+.ui-cal-nav {
+  width: 24px; height: 24px; border: 0; border-radius: 4px; background: none;
+  font-size: 15px; line-height: 1; color: var(--sc-muted); cursor: pointer;
+}
+.ui-cal-nav:hover { background: var(--sc-primary-soft); }
+.ui-cal-week { display: grid; grid-template-columns: repeat(7, 1fr); grid-auto-rows: 20px; }
+.ui-cal-week span { line-height: 20px; text-align: center; font-size: 11px; color: var(--sc-muted, #656d76); }
+.ui-cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); grid-auto-rows: 28px; }
+.ui-cal-day {
+  height: 28px; padding: 0; box-sizing: border-box; line-height: 28px;
+  border: 0; border-radius: 4px; background: none;
+  font: inherit; font-size: 12px; color: var(--sc-text, #1f2328); cursor: pointer;
+}
+.ui-cal-day:hover { background: var(--sc-primary-soft); }
+.ui-cal-day.empty { cursor: default; }
+.ui-cal-day.empty:hover { background: none; }
+.ui-cal-day.active { background: var(--sc-primary); color: #fff; }
+.ui-cal-foot { display: flex; justify-content: flex-end; margin-top: 6px; }
+.ui-cal-clear {
+  border: 0; border-radius: 4px; background: none; padding: 4px 6px;
+  font-size: 12px; color: var(--sc-muted, #656d76); cursor: pointer;
+}
+.ui-cal-clear:hover { background: var(--sc-primary-soft); }
 .sc-fill-handle {
   position: absolute; right: -3px; bottom: -3px; width: 7px; height: 7px;
   background: var(--sc-primary); cursor: crosshair; display: none; z-index: 5;
@@ -88,7 +146,7 @@
 
 /* 填充拖拽预览框 */
 .sc-fill-ghost {
-  position: absolute; border: 1px dashed var(--sc-primary); background: rgba(47,111,237,.06);
+  position: absolute; border: 1px dashed var(--sc-primary); background: rgba(9,105,218,.06);
   pointer-events: none; z-index: 6; display: none;
 }
 
@@ -105,7 +163,7 @@
   padding: 8px 10px; box-sizing: border-box;
   background: #fff; color: var(--sc-text);
   border: 1px solid var(--sc-border-strong); border-radius: var(--sc-radius);
-  box-shadow: 0 8px 24px rgba(31, 35, 40, .14);
+  box-shadow: 0 8px 24px rgba(31, 35, 40, .12);
   font-size: 12px; line-height: 1.6; font-family: inherit;
   white-space: pre-wrap; word-break: break-word;
   pointer-events: none;
@@ -123,9 +181,4 @@
 .sc-log .warn { color: #9a6700; }
 .sc-log .err { color: #cf222e; }
 
-/* 弹层（宿主可覆盖） */
-.sc-pop {
-  position: fixed; z-index: 900; background: #fff; border: 1px solid var(--sc-border-strong);
-  border-radius: var(--sc-radius); box-shadow: 0 8px 24px rgba(31,35,40,.12);
-  font-size: 12px; padding: 6px; min-width: 160px; max-height: 260px; overflow: auto;
-}
+

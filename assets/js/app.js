@@ -23,7 +23,7 @@ import * as Cat from './categories.js';
 import * as Excel from './excel.js';
 import * as MaterialStore from './material-store.js';
 import { renderForm, renderAttrDefTable, mk } from './fields.js';
-import { createSheet, showHoverTip, hideHoverTip } from './sheet-core.js';
+import { createSheet, showHoverTip, hideHoverTip, isTextTruncated } from './sheet-core.js';
 import { openModal, closeModal, toastOk, toastErr, confirm, toast } from './ui.js';
 
 // ---------- 全局状态 ----------
@@ -315,6 +315,7 @@ async function init() {
   bindAccountBar();
   bindGlobalMaterialSearch();
   bindInfoTips();
+  bindTruncatedTips();
   mountQuotaPill();
   await refreshRemote();
 
@@ -1118,11 +1119,6 @@ function buildTreeNode(opts) {
 
   const labelEl = mk('span', { class: 'tree-label' }, opts.label);
   node.appendChild(labelEl);
-  // 分组名被截断时，悬停一会儿浮出完整名称
-  node.addEventListener('mouseenter', () => {
-    if (labelEl.scrollWidth > labelEl.clientWidth + 1) showHoverTip(labelEl, opts.label);
-  });
-  node.addEventListener('mouseleave', hideHoverTip);
   if (opts.count) node.appendChild(mk('span', { class: 'tree-count' }, String(opts.count)));
 
   // 末级分组不能再挂子分组，不显示 ＋
@@ -1622,8 +1618,8 @@ async function renderMaterialsTable(panel, cat) {
 
 // ---------- 表格视图（电子表格内核） ----------
 const SHEET_TYPES = {
-  text: 'text', textarea: 'text', number: 'number', select: 'select', radio: 'select',
-  multiselect: 'multiselect', range: 'range', date: 'date', checkbox: 'bool',
+  text: 'text', textarea: 'text', number: 'number', select: 'select', radio: 'radio',
+  multiselect: 'multiselect', multiselectDropdown: 'multiselectDropdown', range: 'range', date: 'date', checkbox: 'bool',
 };
 
 // 属性列在表格里的 key 加前缀，避免和编码/名称等固定列冲突
@@ -1687,6 +1683,7 @@ async function renderSheetView(wrap, summaries, cat) {
     columns,
     rows: [],
     features: { toolbar: false, search: false, log: false, export: false },
+    onError: (msg) => toastErr(msg),
     onChange: (patches) => saveSheetEdits(patches, byId, baseById, rowDirty),
   });
   state.sheetApi = api;
@@ -2768,6 +2765,26 @@ function bindInfoTips() {
   });
   window.addEventListener('scroll', hideInfoTip, true);
   window.addEventListener('resize', hideInfoTip);
+}
+
+// 全项目通用：任何被省略号截断的文本（表格单元格、分组名、导航名）悬停显示全文
+function bindTruncatedTips() {
+  const SEL = 'td, th, .tree-label, .nav-label';
+  const skip = (e) => e.target.closest && e.target.closest('input, textarea, [contenteditable="true"]');
+  document.addEventListener('mouseover', (e) => {
+    if (skip(e)) return;
+    const el = e.target.closest && e.target.closest(SEL);
+    if (!el) return;
+    if (e.relatedTarget instanceof Element && el.contains(e.relatedTarget)) return;
+    if (!isTextTruncated(el)) { hideHoverTip(); return; }
+    showHoverTip(el, (el.textContent || '').trim());
+  });
+  document.addEventListener('mouseout', (e) => {
+    const el = e.target.closest && e.target.closest(SEL);
+    if (!el) return;
+    if (e.relatedTarget instanceof Element && el.contains(e.relatedTarget)) return;
+    hideHoverTip();
+  });
 }
 
 function showInfoTip(icon) {
@@ -4052,3 +4069,4 @@ function progressEnd() {
   wrap.hidden = true;
   wrap.classList.remove('indeterminate');
 }
+
